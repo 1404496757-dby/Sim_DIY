@@ -1,0 +1,7 @@
+gym==0.9.4
+gymnasium~=0.29.1
+pathos>=0.3.1
+scipy>=1.11.0
+matplotlib>=3.7.2
+numpy>=1.25.0
+pandas>=2.0.3
