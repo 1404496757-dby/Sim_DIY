@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 class RECCoController(Controller):
     """
     RECCo Controller implementation based on the Sorensen diabetic model
-    with ANYA fuzzy rule-based system and online adaptation
+    with ANYA fuzzy rule-based system and online adaptation.
     """
 
     def __init__(self, target=100, sample_time=5):
