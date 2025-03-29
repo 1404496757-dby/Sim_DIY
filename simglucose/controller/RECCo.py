@@ -1,264 +1,265 @@
+import numpy as np
 from .base import Controller
 from .base import Action
-import numpy as np
 import logging
 
 logger = logging.getLogger(__name__)
 
 
 class RECCoController(Controller):
-    """
-    RECCo Controller implementation based on the Sorensen diabetic model
-    with ANYA fuzzy rule-based system and online adaptation.
-    """
-
-    def __init__(self, target=100, sample_time=5):
+    def __init__(self, target=140, u_min=0, u_max=20, y_min=0, y_max=300,
+                 tau=40, sample_time=3, G_sign=1):
         """
-        Initialize RECCo controller parameters
-        :param target: Target blood glucose level (mg/dl)
-        :param sample_time: Control update frequency (minutes)
-        """
-        super().__init__(init_state={
-            'clouds': [],
-            'adapt_params': {
-                'P': [], 'I': [], 'D': [], 'R': [],
-                'gamma': 0.1, 'lambda': 0.5, 'sigma': 0.1
-            },
-            'tracking_error': 0.0,
-            'prev_error': 0.0,
-            'integral_sum': 0.0
-        })
+        Initialize RECCo controller
 
-        # Controller parameters
+        Args:
+            target: desired blood glucose level (mg/dL)
+            u_min: minimum insulin input
+            u_max: maximum insulin input
+            y_min: minimum possible glucose reading
+            y_max: maximum possible glucose reading
+            tau: estimated time constant of the system (minutes)
+            sample_time: time between measurements (minutes)
+            G_sign: known sign of the process gain (+1 or -1)
+        """
         self.target = target
+        self.u_min = u_min
+        self.u_max = u_max
+        self.y_min = y_min
+        self.y_max = y_max
+        self.tau = tau
         self.sample_time = sample_time
-        self.umax = 100  # Maximum insulin rate (U/min)
-        self.umin = 0  # Minimum insulin rate (U/min)
-        self.y_min = 20  # Minimum glucose (mg/dl)
-        self.y_max = 200  # Maximum glucose (mg/dl)
-        self.dead_zone = 0.1
-        self.gamma_max = 0.8
-        self.n_add = 20
+        self.G_sign = G_sign
 
-        # Initialize reference model
-        self.a_r = 0.93  # Pole parameter
-        self.tau = 40  # Time constant
+        # Reference model parameters
+        self.a_r = 1 - (sample_time / tau)
+
+        # Evolving law parameters
+        self.gamma_max = 0.93  # Fixed threshold for adding new clouds
+        self.n_add = 20  # Minimum time between adding clouds
+        self.last_add_time = -np.inf
+
+        # Adaptation law parameters
+        self.alpha_P = 0.1 * (u_max - u_min) / 20
+        self.alpha_I = 0.1 * (u_max - u_min) / 20
+        self.alpha_D = 0.1 * (u_max - u_min) / 20
+        self.alpha_R = 0.1 * (u_max - u_min) / 20
+
+        # Robustness parameters
+        self.d_dead = 5  # Dead zone threshold (mg/dL)
+        self.sigma_L = 1e-6  # Leakage factor
+
+        # Initialize clouds (empty at start)
+        self.clouds = []
+
+        # Tracking variables
+        self.y_k_prev = None  # Previous plant output
+        self.y_r_prev = None  # Previous reference model output
+        self.e_k_prev = None  # Previous tracking error
+        self.Sigma_e = 0  # Integral of tracking error
+        self.r_k_prev = None  # Previous reference signal
 
     def policy(self, observation, reward, done, **kwargs):
-        """
-        Main control policy implementation
-        :param observation: Current glucose reading
-        :param reward: Current reward value
-        :param done: Episode termination flag
-        :param kwargs: Additional parameters (patient_name, sample_time)
-        :return: Action tuple (basal, bolus)
-        """
-        # Extract necessary parameters
-        patient_name = kwargs.get('patient_name', 'default')
-        meal = kwargs.get('meal', 0.0)  # g/min
-        env_sample_time = kwargs.get('sample_time', self.sample_time)
+        # Get current blood glucose reading
+        y_k = observation.CGM
+        r_k = self.target
 
-        # Get current glucose value
-        current_glucose = observation.CGM
+        # Initialize on first call
+        if self.y_k_prev is None:
+            self.y_k_prev = y_k
+            self.y_r_prev = y_k
+            self.e_k_prev = 0
+            self.r_k_prev = r_k
+            return Action(basal=0, bolus=0)
 
-        # Calculate control action
-        control_signal = self._recco_control(current_glucose, meal, env_sample_time)
+        # 1. Reference model update
+        y_r_k = self.a_r * self.y_r_prev + (1 - self.a_r) * r_k
 
-        # Apply saturation
-        control_signal = np.clip(control_signal, self.umin, self.umax)
+        # 2. Calculate tracking error
+        e_k = y_r_k - y_k
+        Delta_e = e_k - self.e_k_prev
 
-        # Split into basal and bolus (assuming bolus is meal-related)
-        basal = control_signal
-        bolus = 0.0  # Meal bolus handled separately in this example
+        # Update integral term with anti-windup
+        if self.u_min < self.u_k_prev < self.u_max:
+            self.Sigma_e += e_k * self.sample_time
 
-        return Action(basal=basal, bolus=bolus)
+        # 3. Create normalized data vector (2D)
+        Delta_y = self.y_max - self.y_min
+        Delta_e_norm = Delta_y / 2
+        x_k = np.array([
+            e_k / Delta_e_norm,
+            (y_r_k - self.y_min) / Delta_y
+        ])
 
-    def _recco_control(self, glucose, meal, sample_time):
-        """
-        Core RECCo control algorithm
-        :param glucose: Current blood glucose (mg/dl)
-        :param meal: Current meal intake (g/min)
-        :param sample_time: Control interval (minutes)
-        :return: Calculated insulin rate (U/min)
-        """
-        # Update reference model
-        ref_model_output = self._update_reference_model(glucose)
+        # 4. Evolving law - update or add clouds
+        active_cloud_idx = self._update_clouds(x_k)
 
-        # Calculate tracking error
-        error = ref_model_output - glucose
-        delta_error = error - self.state['tracking_error']
-        self.state['tracking_error'] = error
+        # 5. Adaptation law - update PID-R parameters of active cloud
+        if active_cloud_idx is not None:
+            self._adapt_parameters(active_cloud_idx, e_k, Delta_e, r_k)
 
-        # Update integral sum with anti-windup
-        if self.umin < self.state['control_signal'] < self.umax:
-            self.state['integral_sum'] += error * sample_time
+        # 6. Calculate control signal
+        u_k = self._calculate_control_signal(e_k, Delta_e)
+
+        # 7. Apply output constraints
+        u_k = np.clip(u_k, self.u_min, self.u_max)
+
+        # Update previous values
+        self.y_k_prev = y_k
+        self.y_r_prev = y_r_k
+        self.e_k_prev = e_k
+        self.r_k_prev = r_k
+        self.u_k_prev = u_k
+
+        logger.info(f'Control input: {u_k}')
+        return Action(basal=u_k, bolus=0)
+
+    def _update_clouds(self, x_k):
+        """Update cloud structure and return index of active cloud"""
+        if not self.clouds:
+            # First data point - create initial cloud
+            self._add_cloud(x_k)
+            return 0
+
+        # Calculate local densities for all clouds
+        gamma = []
+        for cloud in self.clouds:
+            mu_i = cloud['mu']
+            sigma_i = cloud['sigma']
+            M_i = cloud['M']
+
+            # Calculate local density (6)
+            gamma_i = 1 / (1 + np.linalg.norm(x_k - mu_i) ** 2 + sigma_i - np.linalg.norm(mu_i) ** 2)
+            gamma.append(gamma_i)
+
+        max_gamma = max(gamma)
+        active_cloud_idx = gamma.index(max_gamma)
+
+        # Check if we should add a new cloud
+        current_time = len(self.clouds)  # Simplified - should use actual time
+        if (max_gamma < self.gamma_max and
+                current_time - self.last_add_time >= self.n_add):
+            self._add_cloud(x_k)
+            active_cloud_idx = len(self.clouds) - 1
+            self.last_add_time = current_time
         else:
-            self.state['integral_sum'] = np.clip(self.state['integral_sum'] + error * sample_time,
-                                                 -self.umax, self.umax)
+            # Update active cloud statistics
+            cloud = self.clouds[active_cloud_idx]
+            M_i = cloud['M']
 
-        # Normalize input space
-        x = self._normalize_input(error, delta_error, glucose)
+            # Update mean (7)
+            cloud['mu'] = (M_i - 1) / M_i * cloud['mu'] + 1 / M_i * x_k
 
-        # Update clouds and fuzzy rules
-        self._update_clouds(x)
+            # Update mean-square length (8)
+            cloud['sigma'] = (M_i - 1) / M_i * cloud['sigma'] + 1 / M_i * np.linalg.norm(x_k) ** 2
 
-        # Calculate control signal using fuzzy rules
-        control_signal = self._fuzzy_inference(x)
+            cloud['M'] += 1
 
-        # Apply protection mechanisms
-        control_signal = self._apply_protection(control_signal)
+        return active_cloud_idx
 
-        return control_signal
+    def _add_cloud(self, x_k):
+        """Add a new cloud to the structure"""
+        # Initialize cloud properties
+        new_cloud = {
+            'mu': x_k,  # Mean value
+            'sigma': np.linalg.norm(x_k) ** 2,  # Mean-square length
+            'M': 1,  # Number of data points
+            'k_add': len(self.clouds),  # Time stamp when added
+            'theta': np.zeros(4)  # PID-R parameters [P, I, D, R]
+        }
 
-    def _update_reference_model(self, glucose):
-        """
-        First-order reference model update
-        :param glucose: Current glucose value
-        :return: Updated reference output
-        """
-        self.state['ref_model_output'] = self.a_r * self.state.get('ref_model_output', self.target) + \
-                                         (1 - self.a_r) * self.target
-        return self.state['ref_model_output']
+        # If not first cloud, initialize parameters as weighted mean of existing clouds
+        if self.clouds:
+            lambdas = [gamma / sum(gamma) for gamma in self._calculate_lambdas(x_k)]
+            new_cloud['theta'] = sum(l * cloud['theta']
+                                     for l, cloud in zip(lambdas, self.clouds))
 
-    def _normalize_input(self, error, delta_error, glucose):
-        """
-        Normalize input variables for fuzzy system
-        :param error: Tracking error
-        :param delta_error: Error derivative
-        :param glucose: Current glucose
-        :return: Normalized input vector
-        """
-        norm_error = (error) / (self.y_max - self.y_min)
-        norm_delta_error = (delta_error) / (self.y_max - self.y_min)
-        norm_glucose = (glucose - self.y_min) / (self.y_max - self.y_min)
-        return np.array([norm_error, norm_delta_error, norm_glucose])
+        self.clouds.append(new_cloud)
 
-    def _update_clouds(self, x):
-        """
-        Update cloud points and fuzzy rules
-        :param x: Normalized input vector
-        """
-        # Calculate distances to existing clouds
-        distances = [np.linalg.norm(x - cloud['mu']) for cloud in self.state['clouds']]
+    def _calculate_lambdas(self, x_k):
+        """Calculate normalized relative densities (5)"""
+        gamma = []
+        for cloud in self.clouds:
+            mu_i = cloud['mu']
+            sigma_i = cloud['sigma']
+            gamma_i = 1 / (1 + np.linalg.norm(x_k - mu_i) ** 2 + sigma_i - np.linalg.norm(mu_i) ** 2)
+            gamma.append(gamma_i)
+        return gamma
 
-        # Check if new cloud is needed
-        if not self.state['clouds'] or min(distances) > self.gamma_max:
-            # Create new cloud
-            new_cloud = {
-                'mu': x,
-                'sigma': np.linalg.norm(x) ** 2,
-                'local_density': 1.0,
-                'parameters': {
-                    'P': 0.1,
-                    'I': 0.05,
-                    'D': 0.01,
-                    'R': 0.0
-                }
-            }
-            self.state['clouds'].append(new_cloud)
+    def _adapt_parameters(self, cloud_idx, e_k, Delta_e, r_k):
+        """Adapt PID-R parameters of the specified cloud (14)"""
+        cloud = self.clouds[cloud_idx]
+        theta = cloud['theta']
+        lambda_k = self._calculate_lambdas(self._get_current_x())[cloud_idx]
+
+        # Dead zone check (17)
+        if abs(e_k) < self.d_dead:
+            return
+
+        # Calculate parameter updates
+        denom = 1 + r_k ** 2
+
+        # For first 5*tau samples, use absolute values
+        if len(self.clouds) < 5 * self.tau / self.sample_time:
+            delta_P = self.alpha_P * self.G_sign * lambda_k * abs(e_k * e_k) / denom
+            delta_I = self.alpha_I * self.G_sign * lambda_k * abs(e_k * Delta_e) / denom
+            delta_D = self.alpha_D * self.G_sign * lambda_k * abs(e_k * Delta_e) / denom
+            delta_R = self.alpha_R * self.G_sign * lambda_k * e_k / denom
         else:
-            # Update closest cloud
-            closest_idx = np.argmin(distances)
-            self.state['clouds'][closest_idx]['mu'] = (self.state['clouds'][closest_idx]['mu'] *
-                                                       (self.state['clouds'][closest_idx]['count'] - 1) + x) / \
-                                                      self.state['clouds'][closest_idx]['count']
-            self.state['clouds'][closest_idx]['sigma'] = (self.state['clouds'][closest_idx]['sigma'] *
-                                                          (self.state['clouds'][closest_idx]['count'] - 1) +
-                                                          np.linalg.norm(x) ** 2) / self.state['clouds'][closest_idx][
-                                                             'count']
-            self.state['clouds'][closest_idx]['count'] += 1
+            delta_P = self.alpha_P * self.G_sign * lambda_k * e_k * e_k / denom
+            delta_I = self.alpha_I * self.G_sign * lambda_k * e_k * Delta_e / denom
+            delta_D = self.alpha_D * self.G_sign * lambda_k * e_k * Delta_e / denom
+            delta_R = self.alpha_R * self.G_sign * lambda_k * e_k / denom
 
-            # Adapt parameters
-            self._adapt_parameters(closest_idx, x)
+        # Apply leakage (19)
+        theta = (1 - self.sigma_L) * theta
 
-    def _adapt_parameters(self, cloud_idx, x):
-        """
-        Adapt controller parameters using tracking error
-        :param cloud_idx: Index of cloud to update
-        :param x: Normalized input vector
-        """
-        cloud = self.state['clouds'][cloud_idx]
-        error = self.state['tracking_error']
-        delta_error = error - self.state['prev_error']
-        self.state['prev_error'] = error
+        # Update parameters with projection (18)
+        # For P, I, D: lower bound = 0, upper bound = infinity
+        # For R: no bounds
+        theta[0] = max(0, theta[0] + delta_P)  # P
+        theta[1] = max(0, theta[1] + delta_I)  # I
+        theta[2] = max(0, theta[2] + delta_D)  # D
+        theta[3] = theta[3] + delta_R  # R
 
-        # Calculate adaptation terms
-        adaptation = self.state['adapt_params']['gamma'] * error * x
+        cloud['theta'] = theta
 
-        # Update PID parameters with leakage
-        cloud['parameters']['P'] += adaptation[0] - self.state['adapt_params']['lambda'] * cloud['parameters']['P']
-        cloud['parameters']['I'] += adaptation[1] - self.state['adapt_params']['lambda'] * cloud['parameters']['I']
-        cloud['parameters']['D'] += adaptation[2] - self.state['adapt_params']['lambda'] * cloud['parameters']['D']
-        cloud['parameters']['R'] += adaptation[3] - self.state['adapt_params']['lambda'] * cloud['parameters']['R']
+    def _calculate_control_signal(self, e_k, Delta_e):
+        """Calculate control signal using weighted average of cloud contributions (16)"""
+        if not self.clouds:
+            return 0
 
-        # Apply parameter limits
-        cloud['parameters']['P'] = np.clip(cloud['parameters']['P'], 0, 1)
-        cloud['parameters']['I'] = np.clip(cloud['parameters']['I'], 0, 0.1)
-        cloud['parameters']['D'] = np.clip(cloud['parameters']['D'], 0, 0.05)
-        cloud['parameters']['R'] = np.clip(cloud['parameters']['R'], -1, 1)
+        x_k = self._get_current_x()
+        lambdas = self._calculate_lambdas(x_k)
+        sum_lambda = sum(lambdas)
 
-    def _fuzzy_inference(self, x):
-        """
-        Fuzzy inference system using cloud points
-        :param x: Normalized input vector
-        :return: Calculated control signal
-        """
-        total_weight = 0.0
-        control_sum = 0.0
+        if sum_lambda == 0:
+            return 0
 
-        for cloud in self.state['clouds']:
-            # Calculate membership value
-            distance = np.linalg.norm(x - cloud['mu'])
-            membership = np.exp(-(distance ** 2) / (2 * cloud['sigma'] ** 2))
+        u_total = 0
+        for i, cloud in enumerate(self.clouds):
+            theta = cloud['theta']
+            P, I, D, R = theta
+            u_i = P * e_k + I * self.Sigma_e + D * Delta_e + R
+            u_total += (lambdas[i] / sum_lambda) * u_i
 
-            # Calculate local control signal
-            p = cloud['parameters']['P']
-            i = cloud['parameters']['I']
-            d = cloud['parameters']['D']
-            r = cloud['parameters']['R']
-            local_control = p * self.state['tracking_error'] + \
-                            i * self.state['integral_sum'] + \
-                            d * (self.state['tracking_error'] - self.state['prev_error']) + r
+        return u_total
 
-            # Update totals
-            control_sum += membership * local_control
-            total_weight += membership
-
-        if total_weight == 0:
-            return 0.0
-        return control_sum / total_weight
-
-    def _apply_protection(self, control):
-        """
-        Apply protection mechanisms to control signal
-        :param control: Raw control signal
-        :return: Protected control signal
-        """
-        # Dead zone
-        if abs(self.state['tracking_error']) < self.dead_zone:
-            return 0.0
-
-        # Rate limiting
-        if self.state.get('prev_control') is not None:
-            control = np.clip(control,
-                              self.state['prev_control'] - 10,
-                              self.state['prev_control'] + 10)
-
-        self.state['prev_control'] = control
-        return control
+    def _get_current_x(self):
+        """Get current normalized data vector"""
+        Delta_y = self.y_max - self.y_min
+        Delta_e_norm = Delta_y / 2
+        return np.array([
+            self.e_k_prev / Delta_e_norm,
+            (self.y_r_prev - self.y_min) / Delta_y
+        ])
 
     def reset(self):
-        """
-        Reset controller state
-        """
-        self.state = {
-            'clouds': [],
-            'adapt_params': {
-                'P': [], 'I': [], 'D': [], 'R': [],
-                'gamma': 0.1, 'lambda': 0.5, 'sigma': 0.1
-            },
-            'tracking_error': 0.0,
-            'prev_error': 0.0,
-            'integral_sum': 0.0,
-            'ref_model_output': self.target
-        }
+        """Reset controller state"""
+        self.clouds = []
+        self.y_k_prev = None
+        self.y_r_prev = None
+        self.e_k_prev = None
+        self.Sigma_e = 0
+        self.r_k_prev = None
+        self.u_k_prev = None
