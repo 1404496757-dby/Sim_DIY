@@ -15,6 +15,7 @@ simglucose/actuator/pump.py
 simglucose/analysis/__init__.py
 simglucose/analysis/report.py
 simglucose/analysis/risk.py
+simglucose/controller/RECCo.py
 simglucose/controller/__init__.py
 simglucose/controller/basal_bolus_ctrller.py
 simglucose/controller/base.py
