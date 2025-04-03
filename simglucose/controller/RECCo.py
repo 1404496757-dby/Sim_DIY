@@ -79,9 +79,7 @@ class RECCoController(Controller):
         e_k = y_r_k - y_k
         Delta_e = e_k - self.e_k_prev
 
-        # Update integral term with anti-windup
-        if self.u_min < self.u_k_prev < self.u_max:
-            self.Sigma_e += e_k * self.sample_time
+
 
         # 3. Create normalized data vector (2D)
         Delta_y = self.y_max - self.y_min
@@ -110,6 +108,10 @@ class RECCoController(Controller):
         self.e_k_prev = e_k
         self.r_k_prev = r_k
         self.u_k_prev = u_k
+
+        # Update integral term with anti-windup
+        if self.u_min < self.u_k_prev < self.u_max:
+            self.Sigma_e += e_k * self.sample_time
 
         logger.info(f'Control input: {u_k}')
         return Action(basal=u_k, bolus=0)
