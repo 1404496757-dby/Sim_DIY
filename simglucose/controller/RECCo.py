@@ -58,6 +58,7 @@ class RECCoController(Controller):
         self.e_k_prev = None  # Previous tracking error
         self.Sigma_e = 0  # Integral of tracking error
         self.r_k_prev = None  # Previous reference signal
+        self.u_k_prev = None
 
     def policy(self, observation, reward, done, **kwargs):
         # Get current blood glucose reading
@@ -110,6 +111,7 @@ class RECCoController(Controller):
         self.e_k_prev = e_k
         self.r_k_prev = r_k
         self.u_k_prev = u_k
+
 
         logger.info(f'Control input: {u_k}')
         return Action(basal=u_k, bolus=0)
