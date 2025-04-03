@@ -29,7 +29,7 @@ class RECCoController(Controller):
 
     def policy(self, observation, reward, done, **info):
         bg = observation.CGM  # 当前血糖值
-        current_time = info.get('sample_time', 0)
+        current_time = info.get('time', 0)
 
         # 高低血糖应急处理
         if bg < 4.0:
