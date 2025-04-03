@@ -1,267 +1,166 @@
+from .base import Controller, Action
 import numpy as np
-from .base import Controller
-from .base import Action
-import logging
-
-logger = logging.getLogger(__name__)
 
 
 class RECCoController(Controller):
-    def __init__(self, target=140, u_min=0, u_max=20, y_min=0, y_max=300,
-                 tau=40, sample_time=3, G_sign=1):
-        """
-        Initialize RECCo controller
+    def __init__(self, target_range=(7.8, 10.0), u_range=(0, 6), Ts=60, tau=3600):
+        self.target_min, self.target_max = target_range  # 血糖目标范围 (mmol/L)
+        self.u_min, self.u_max = u_range  # 胰岛素输注范围 (U/h)
+        self.Ts = Ts  # 采样时间 (秒)
+        self.tau = tau  # 时间常数 (秒)
+        self.ar = 1 - Ts / tau  # 参考模型参数
 
-        Args:
-            target: desired blood glucose level (mg/dL)
-            u_min: minimum insulin input
-            u_max: maximum insulin input
-            y_min: minimum possible glucose reading
-            y_max: maximum possible glucose reading
-            tau: estimated time constant of the system (minutes)
-            sample_time: time between measurements (minutes)
-            G_sign: known sign of the process gain (+1 or -1)
-        """
-        self.target = target
-        self.u_min = u_min
-        self.u_max = u_max
-        self.y_min = y_min
-        self.y_max = y_max
-        self.tau = tau
-        self.sample_time = sample_time
-        self.G_sign = G_sign
+        # 云数据结构
+        self.clouds = []  # 每个云：[mean, mean_sq, count, params]
+        self.last_update = 0
 
-        # Reference model parameters
-        self.a_r = 1 - (sample_time / tau)
+        # 跟踪误差相关
+        self.error_sum = 0  # 误差积分项
+        self.last_error = 0  # 上次误差
+        self.ref_model_output = None  # 参考模型输出
 
-        # Evolving law parameters
-        self.gamma_max = 0.93  # Fixed threshold for adding new clouds
-        self.n_add = 20  # Minimum time between adding clouds
-        self.last_add_time = -np.inf
+        # 自适应参数
+        self.alpha = 0.1 * (u_range[1] - u_range[0]) / 20  # 缩放后的自适应增益
+        self.gamma_max = 0.93  # 云添加阈值
+        self.n_add = 20  # 最小添加间隔
 
-        # Adaptation law parameters
-        self.alpha_P = 0.1 * (u_max - u_min) / 20
-        self.alpha_I = 0.1 * (u_max - u_min) / 20
-        self.alpha_D = 0.1 * (u_max - u_min) / 20
-        self.alpha_R = 0.1 * (u_max - u_min) / 20
+        # ICU应急处理状态
+        self.insulin_suspended = False
 
-        # Robustness parameters
-        self.d_dead = 5  # Dead zone threshold (mg/dL)
-        self.sigma_L = 1e-6  # Leakage factor
+    def policy(self, observation, reward, done, **info):
+        bg = observation.CGM  # 当前血糖值
+        current_time = info.get('sample_time', 0)
 
-        # Initialize clouds (empty at start)
-        self.clouds = []
+        # 高低血糖应急处理
+        if bg < 4.0:
+            return self._handle_hypoglycemia()
+        elif bg > 20.0:
+            return Action(basal=0, bolus=0)  # 停止并通知医生
 
-        # Tracking variables
-        self.y_k_prev = None  # Previous plant output
-        self.y_r_prev = None  # Previous reference model output
-        self.e_k_prev = None  # Previous tracking error
-        self.Sigma_e = 0  # Integral of tracking error
-        self.r_k_prev = None  # Previous reference signal
-        self.u_k_prev = None
+        # 初始化参考模型
+        if self.ref_model_output is None:
+            self.ref_model_output = bg
 
-    def policy(self, observation, reward, done, **kwargs):
-        # Get current blood glucose reading
-        y_k = observation.CGM
-        r_k = self.target
+        # 计算参考轨迹
+        target = (self.target_min + self.target_max) / 2  # 目标中值
+        self.ref_model_output = self.ar * self.ref_model_output + (1 - self.ar) * target
 
-        # Initialize on first call
-        if self.y_k_prev is None:
-            self.y_k_prev = y_k
-            self.y_r_prev = y_k
-            self.e_k_prev = 0
-            self.r_k_prev = r_k
-            return Action(basal=0, bolus=0)
+        # 计算跟踪误差
+        error = self.ref_model_output - bg
+        delta_error = error - self.last_error
 
-        # 1. Reference model update
-        y_r_k = self.a_r * self.y_r_prev + (1 - self.a_r) * r_k
+        # 更新误差积分（带抗饱和）
+        if not self.insulin_suspended and self.u_min < self.current_insulin < self.u_max:
+            self.error_sum += error
+        self.last_error = error
 
-        # 2. Calculate tracking error
-        e_k = y_r_k - y_k
-        Delta_e = e_k - self.e_k_prev
+        # 构建数据点
+        x = self._normalize_data_point(error, bg)
 
-        # Update integral term with anti-windup
-        if self.u_min < self.u_k_prev < self.u_max:
-            self.Sigma_e += e_k * self.sample_time
+        # 云结构演化
+        self._update_cloud_structure(x, current_time)
 
-        # 3. Create normalized data vector (2D)
-        Delta_y = self.y_max - self.y_min
-        Delta_e_norm = Delta_y / 2
-        x_k = np.array([
-            e_k / Delta_e_norm,
-            (y_r_k - self.y_min) / Delta_y
+        # 计算控制信号
+        u = self._calculate_control(x, error, delta_error)
+
+        # 应用胰岛素限制
+        basal = np.clip(u, self.u_min, self.u_max)
+        return Action(basal=basal, bolus=0)
+
+    def _normalize_data_point(self, error, bg):
+        delta_y = self.target_max - self.target_min
+        delta_error = delta_y / 2
+        return np.array([
+            error / delta_error,
+            (bg - self.target_min) / delta_y
         ])
 
-        # 4. Evolving law - update or add clouds
-        active_cloud_idx = self._update_clouds(x_k)
-
-        # 5. Adaptation law - update PID-R parameters of active cloud
-        if active_cloud_idx is not None:
-            self._adapt_parameters(active_cloud_idx, e_k, Delta_e, r_k)
-
-        # 6. Calculate control signal
-        u_k = self._calculate_control_signal(e_k, Delta_e)
-
-        # 7. Apply output constraints
-        u_k = np.clip(u_k, self.u_min, self.u_max)
-
-        # Update previous values
-        self.y_k_prev = y_k
-        self.y_r_prev = y_r_k
-        self.e_k_prev = e_k
-        self.r_k_prev = r_k
-        self.u_k_prev = u_k
-
-
-        logger.info(f'Control input: {u_k}')
-        return Action(basal=u_k, bolus=0)
-
-    def _update_clouds(self, x_k):
-        """Update cloud structure and return index of active cloud"""
+    def _update_cloud_structure(self, x, current_time):
         if not self.clouds:
-            # First data point - create initial cloud
-            self._add_cloud(x_k)
-            return 0
-
-        # Calculate local densities for all clouds
-        gamma = []
-        for cloud in self.clouds:
-            mu_i = cloud['mu']
-            sigma_i = cloud['sigma']
-            M_i = cloud['M']
-
-            # Calculate local density (6)
-            gamma_i = 1 / (1 + np.linalg.norm(x_k - mu_i) ** 2 + sigma_i - np.linalg.norm(mu_i) ** 2)
-            gamma.append(gamma_i)
-
-        max_gamma = max(gamma)
-        active_cloud_idx = gamma.index(max_gamma)
-
-        # Check if we should add a new cloud
-        current_time = len(self.clouds)  # Simplified - should use actual time
-        if (max_gamma < self.gamma_max and
-                current_time - self.last_add_time >= self.n_add):
-            self._add_cloud(x_k)
-            active_cloud_idx = len(self.clouds) - 1
-            self.last_add_time = current_time
-        else:
-            # Update active cloud statistics
-            cloud = self.clouds[active_cloud_idx]
-            M_i = cloud['M']
-
-            # Update mean (7)
-            cloud['mu'] = (M_i - 1) / M_i * cloud['mu'] + 1 / M_i * x_k
-
-            # Update mean-square length (8)
-            cloud['sigma'] = (M_i - 1) / M_i * cloud['sigma'] + 1 / M_i * np.linalg.norm(x_k) ** 2
-
-            cloud['M'] += 1
-
-        return active_cloud_idx
-
-    def _add_cloud(self, x_k):
-        """Add a new cloud to the structure"""
-        # Initialize cloud properties
-        new_cloud = {
-            'mu': x_k,  # Mean value
-            'sigma': np.linalg.norm(x_k) ** 2,  # Mean-square length
-            'M': 1,  # Number of data points
-            'k_add': len(self.clouds),  # Time stamp when added
-            'theta': np.zeros(4)  # PID-R parameters [P, I, D, R]
-        }
-
-        # If not first cloud, initialize parameters as weighted mean of existing clouds
-        if self.clouds:
-            lambdas = [gamma / sum(gamma) for gamma in self._calculate_lambdas(x_k)]
-            new_cloud['theta'] = sum(l * cloud['theta']
-                                     for l, cloud in zip(lambdas, self.clouds))
-
-        self.clouds.append(new_cloud)
-
-    def _calculate_lambdas(self, x_k):
-        """Calculate normalized relative densities (5)"""
-        gamma = []
-        for cloud in self.clouds:
-            mu_i = cloud['mu']
-            sigma_i = cloud['sigma']
-            gamma_i = 1 / (1 + np.linalg.norm(x_k - mu_i) ** 2 + sigma_i - np.linalg.norm(mu_i) ** 2)
-            gamma.append(gamma_i)
-        return gamma
-
-    def _adapt_parameters(self, cloud_idx, e_k, Delta_e, r_k):
-        """Adapt PID-R parameters of the specified cloud (14)"""
-        cloud = self.clouds[cloud_idx]
-        theta = cloud['theta']
-        lambda_k = self._calculate_lambdas(self._get_current_x())[cloud_idx]
-
-        # Dead zone check (17)
-        if abs(e_k) < self.d_dead:
+            # 初始化第一个云
+            self.clouds.append({
+                'mean': x.copy(),
+                'mean_sq': np.dot(x, x),
+                'count': 1,
+                'params': np.zeros(4),  # [P, I, D, R]
+                'last_used': current_time
+            })
             return
 
-        # Calculate parameter updates
-        denom = 1 + r_k ** 2
+        # 计算各云密度
+        densities = []
+        for cloud in self.clouds:
+            diff = x - cloud['mean']
+            density = 1 / (1 + np.dot(diff, diff) + cloud['mean_sq'] - np.dot(cloud['mean'], cloud['mean']))
+            densities.append(density)
 
-        # For first 5*tau samples, use absolute values
-        if len(self.clouds) < 5 * self.tau / self.sample_time:
-            delta_P = self.alpha_P * self.G_sign * lambda_k * abs(e_k * e_k) / denom
-            delta_I = self.alpha_I * self.G_sign * lambda_k * abs(e_k * Delta_e) / denom
-            delta_D = self.alpha_D * self.G_sign * lambda_k * abs(e_k * Delta_e) / denom
-            delta_R = self.alpha_R * self.G_sign * lambda_k * e_k / denom
-        else:
-            delta_P = self.alpha_P * self.G_sign * lambda_k * e_k * e_k / denom
-            delta_I = self.alpha_I * self.G_sign * lambda_k * e_k * Delta_e / denom
-            delta_D = self.alpha_D * self.G_sign * lambda_k * e_k * Delta_e / denom
-            delta_R = self.alpha_R * self.G_sign * lambda_k * e_k / denom
+        max_density = max(densities)
+        active_idx = densities.index(max_density)
 
-        # Apply leakage (19)
-        theta = (1 - self.sigma_L) * theta
+        # 更新活跃云参数
+        cloud = self.clouds[active_idx]
+        cloud['count'] += 1
+        cloud['mean'] = (cloud['count'] - 1) / cloud['count'] * cloud['mean'] + x / cloud['count']
+        cloud['mean_sq'] = (cloud['count'] - 1) / cloud['count'] * cloud['mean_sq'] + np.dot(x, x) / cloud['count']
+        cloud['last_used'] = current_time
 
-        # Update parameters with projection (18)
-        # For P, I, D: lower bound = 0, upper bound = infinity
-        # For R: no bounds
-        theta[0] = max(0, theta[0] + delta_P)  # P
-        theta[1] = max(0, theta[1] + delta_I)  # I
-        theta[2] = max(0, theta[2] + delta_D)  # D
-        theta[3] = theta[3] + delta_R  # R
+        # 添加新云条件
+        if (max_density < self.gamma_max and
+                current_time - self.last_update > self.n_add):
+            new_params = sum(c['params'] * d for c, d in zip(self.clouds, densities)) / sum(densities)
+            self.clouds.append({
+                'mean': x.copy(),
+                'mean_sq': np.dot(x, x),
+                'count': 1,
+                'params': new_params,
+                'last_used': current_time
+            })
+            self.last_update = current_time
 
-        cloud['theta'] = theta
-
-    def _calculate_control_signal(self, e_k, Delta_e):
-        """Calculate control signal using weighted average of cloud contributions (16)"""
+    def _calculate_control(self, x, error, delta_error):
         if not self.clouds:
             return 0
 
-        x_k = self._get_current_x()
-        lambdas = self._calculate_lambdas(x_k)
-        sum_lambda = sum(lambdas)
-
-        if sum_lambda == 0:
-            return 0
-
-        u_total = 0
+        # 计算各云权重
+        densities = []
+        for cloud in self.clouds:
+            diff = x - cloud['mean']
+            density = 1 / (1 + np.dot(diff, diff) + cloud['mean_sq'] - np.dot(cloud['mean'], cloud['mean']))
+            densities.append(density)
+        weights = np.array(densities) / sum(densities)
+        # 自适应参数更新
         for i, cloud in enumerate(self.clouds):
-            theta = cloud['theta']
-            P, I, D, R = theta
-            u_i = P * e_k + I * self.Sigma_e + D * Delta_e + R
-            u_total += (lambdas[i] / sum_lambda) * u_i
+            if weights[i] < 0.1:  # 只更新活跃云
+                continue
 
-        return u_total
+            # 带死区的参数更新
+            if abs(error) > 1.0:  # 死区阈值
+                delta_p = self.alpha * np.sign(1) * weights[i] * abs(error * error) / (1 + error ** 2)
+                delta_i = self.alpha * np.sign(1) * weights[i] * abs(error * delta_error) / (1 + error ** 2)
+                delta_r = self.alpha * np.sign(1) * weights[i] * error / (1 + error ** 2)
 
-    def _get_current_x(self):
-        """Get current normalized data vector"""
-        Delta_y = self.y_max - self.y_min
-        Delta_e_norm = Delta_y / 2
-        return np.array([
-            self.e_k_prev / Delta_e_norm,
-            (self.y_r_prev - self.y_min) / Delta_y
-        ])
+                cloud['params'][0] += delta_p  # P
+                cloud['params'][1] += delta_i  # I
+                cloud['params'][3] += delta_r  # R
+
+        # 计算各云控制量
+        contributions = []
+        for cloud in self.clouds:
+            P, I, D, R = cloud['params']
+            u_cloud = P * error + I * self.error_sum + D * delta_error + R
+            contributions.append(u_cloud)
+
+        # 加权平均
+        return np.dot(weights, contributions)
+
+    def _handle_hypoglycemia(self):
+        self.insulin_suspended = True
+        self.error_sum = 0  # 重置积分项
+        return Action(basal=0, bolus=0)  # 停止胰岛素
 
     def reset(self):
-        """Reset controller state"""
         self.clouds = []
-        self.y_k_prev = None
-        self.y_r_prev = None
-        self.e_k_prev = None
-        self.Sigma_e = 0
-        self.r_k_prev = None
-        self.u_k_prev = None
+        self.error_sum = 0
+        self.last_error = 0
+        self.ref_model_output = None
+        self.insulin_suspended = False
