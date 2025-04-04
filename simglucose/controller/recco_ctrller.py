@@ -168,7 +168,7 @@ class RECCoGlucoseController(Controller):
 
             # 低血糖保护
             if CGM < 80:
-                basal *= 0.5
+                basal = 0
                 bolus = 0
 
         # 更新状态
