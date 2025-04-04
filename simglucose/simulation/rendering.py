@@ -11,11 +11,12 @@ class Viewer(object):
         self.start_time = start_time
         self.patient_name = patient_name
         self.fig, self.axes, self.lines = self.initialize()
+        self.gird()
         self.update()
 
     def initialize(self):
         plt.ion()
-        plt.grid(b=True,axis='x',linestyle='--')
+        # plt.grid(axis='x',linestyle='--')
         fig, axes = plt.subplots(4)
 
         axes[0].set_ylabel('BG (mg/dL)')
