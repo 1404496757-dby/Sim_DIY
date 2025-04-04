@@ -1,8 +1,8 @@
 import cvxpy as cp
 
 class MPCController(Controller):
-    def __init__(self, init_state, prediction_horizon=5, control_horizon=2):
-        super().__init__(init_state)
+    def __init__(self, prediction_horizon=5, control_horizon=2):
+        # super().__init__(init_state)
         self.prediction_horizon = prediction_horizon
         self.control_horizon = control_horizon
         # 定义模型参数
