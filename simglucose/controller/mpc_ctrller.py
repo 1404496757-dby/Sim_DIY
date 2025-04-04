@@ -7,7 +7,7 @@ class MPCController(Controller):
     def __init__(self, insulin=1.0):
         self.insulin = insulin  # 初始胰岛素值
         self.pred_horizon = 10  # 预测步长
-        self.dt = 5  # 采样时间（分钟）
+        self.dt = 3  # 采样时间（分钟）
         self.target_glucose = 110  # 目标血糖 (mg/dL)
 
     def policy(self, observation, reward, done, **info):
