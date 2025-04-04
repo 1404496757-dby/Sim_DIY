@@ -23,54 +23,59 @@ class MPCController(Controller):
 
     def mpc_controller(self, current_cgm):
         """
-        使用 MPC 计算最佳胰岛素注射量
+        使用MPC计算最佳胰岛素剂量，基于Bergman最小模型
         """
         N = self.pred_horizon  # 预测步长
         u = cp.Variable(N)  # 胰岛素输入变量
-        x = cp.Variable(N + 1)  # 预测血糖值
-        x0 = current_cgm  # 初始血糖值
+        G = cp.Variable(N + 1)  # 血糖浓度
+        X = cp.Variable(N + 1)  # 胰岛素敏感性
+        I = cp.Variable(N + 1)  # 胰岛素浓度
+        G0 = current_cgm  # 初始血糖值
+        X0, I0 = 0, 0  # 初始状态假设
 
-        # 动力学模型（简化版本）
-        A = 1.0  # 血糖变化因子
-        B = -0.5  # 胰岛素对血糖影响系数
-        x_pred = [x0]
+        # 约束条件
+        constraints = [G[0] == G0, X[0] == X0, I[0] == I0]
+
+        # 使用完整Bergman模型进行预测
         for i in range(N):
-            x_pred.append(A * x_pred[i] + B * u[i])
+            constraints += [
+                G[i + 1] == G[i] + self.dt * (-self.p1 * G[i] - X[i] * G[i]),
+                X[i + 1] == X[i] + self.dt * (-self.p2 * X[i] + self.p3 * I[i]),
+                I[i + 1] == I[i] + self.dt * (-self.p4 * I[i] + u[i])
+            ]
 
-        # 目标函数（最小化血糖偏差 + 胰岛素使用量）
+        # 目标函数：最小化血糖偏差 + 胰岛素使用
         objective = cp.Minimize(
-            cp.sum_squares(x - self.target_glucose) + 0.1 * cp.sum_squares(u)
+            cp.sum_squares(G - self.target_glucose) + 0.1 * cp.sum_squares(u)
         )
 
         # 约束条件
-        constraints = [
-            x[0] == x0,
-            x[1:] == A * x[:-1] + B * u,
+        constraints += [
             u >= 0,  # 胰岛素不能为负
-            u <= 6,  # ICU 规定最大值 6U/h
-            x >= 70,  # 防止低血糖
-            x <= 250  # 防止过高血糖
+            u <= 6,  # ICU 规定最大6U/h
+            G >= 70,  # 防止低血糖
+            G <= 250  # 防止高血糖
         ]
 
-        # ICU 胰岛素调整规则（与上次测量值对比）
+        # 根据ICU方案调整胰岛素
         if self.prev_glucose is not None:
             if current_cgm > 140 and current_cgm - self.prev_glucose >= 18:
-                constraints.append(u[0] >= self.insulin + 1)  # 增加 1U
+                constraints.append(u[0] >= self.insulin + 1)
             elif current_cgm > 140 and self.prev_glucose - current_cgm >= 18:
-                constraints.append(u[0] <= self.insulin - 1)  # 减少 1U
+                constraints.append(u[0] <= self.insulin - 1)
 
         # 求解优化问题
         prob = cp.Problem(objective, constraints)
         prob.solve()
 
-        # 选择符合 ICU 方案的最优胰岛素速率
+        # 选择符合ICU方案的最优胰岛素速率
         optimal_insulin = max(0, min(6, u.value[0]))  # 限制在 0-6 U/h
         for limit in reversed(self.insulin_limits):
             if optimal_insulin >= limit:
                 optimal_insulin = limit
                 break
 
-        self.prev_glucose = current_cgm  # 更新血糖记录
+        self.prev_glucose = current_cgm  # 记录上次血糖
         return optimal_insulin  # 返回最优胰岛素值
 
     def reset(self):
