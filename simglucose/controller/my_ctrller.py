@@ -27,7 +27,7 @@ class MyController(Controller):
                  controller action contains two entries: basal, bolus
         '''
         # self.state = observation
-        action = Action(basal=self.insulin, bolus=0)
+        action = Action(basal=self.insulin, bolus=0.2)
         return action
 
     def update_insulin(self,get_insulin):
