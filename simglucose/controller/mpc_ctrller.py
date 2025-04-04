@@ -3,7 +3,7 @@ import cvxpy as cp
 from .base import Controller, Action
 
 
-class MyController(Controller):
+class MPCController(Controller):
     def __init__(self, insulin=1.0):
         self.insulin = insulin  # 初始胰岛素值
         self.pred_horizon = 10  # 预测步长

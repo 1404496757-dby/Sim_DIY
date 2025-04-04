@@ -19,6 +19,7 @@ simglucose/controller/RECCo.py
 simglucose/controller/__init__.py
 simglucose/controller/basal_bolus_ctrller.py
 simglucose/controller/base.py
+simglucose/controller/mpc_ctrller.py
 simglucose/controller/my_ctrller.py
 simglucose/controller/pid_ctrller.py
 simglucose/envs/__init__.py
