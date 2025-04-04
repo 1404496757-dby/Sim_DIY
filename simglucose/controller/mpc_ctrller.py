@@ -11,6 +11,7 @@ class MPCController(Controller):
         self.dt = dt  # 采样时间（分钟）
         self.target_glucose = target_glucose  # 目标血糖值（ICU 目标 7.8-10.0mmol/L, 取 160mg/dL）
         self.insulin_limits = [0, 2, 4, 5, 6]  # ICU 规定的胰岛素速率范围
+        self.p1, self.p2, self.p3, self.p4 = 0.02, 0.02, 0.0005, 0.1
 
     def policy(self, observation, reward, done, **info):
         """
