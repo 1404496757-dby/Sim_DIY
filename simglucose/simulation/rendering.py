@@ -11,7 +11,7 @@ class Viewer(object):
         self.start_time = start_time
         self.patient_name = patient_name
         self.fig, self.axes, self.lines = self.initialize()
-        self.gird()
+        self.grid()
         self.update()
 
     def initialize(self):
@@ -116,6 +116,9 @@ class Viewer(object):
         adjust_xlim(self.axes[3], data.index[-1], xlabel=True)
 
         self.update()
+
+    def grid(self):
+        plt.grid()
 
     def close(self):
         plt.close(self.fig)
