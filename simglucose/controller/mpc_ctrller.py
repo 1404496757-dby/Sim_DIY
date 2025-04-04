@@ -14,7 +14,6 @@ class MPController(Controller):
             prediction_horizon: 预测时域(30分钟为单位)
             control_horizon: 控制时域(30分钟为单位)
         """
-        super().__init__()
         self.patient = T1DPatient.withName(patient_name)
         self.N = prediction_horizon
         self.M = control_horizon
@@ -25,7 +24,8 @@ class MPController(Controller):
         self.safe_max = 180
 
         # 控制参数
-        self.basal_max = 3 * self.patient._basal  # 最大基础率
+        # self.basal_max = 3 * self.patient._basal  # 最大基础率
+        self.basal_max = 35  # 最大基础率
         self.bolus_max = 5  # 最大bolus剂量(U)
 
         # 权重矩阵
