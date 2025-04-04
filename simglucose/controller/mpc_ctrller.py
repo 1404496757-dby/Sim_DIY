@@ -1,85 +1,126 @@
 import numpy as np
 import cvxpy as cp
-from .base import Controller, Action
+from simglucose.simulation.env import T1DSimEnv
+from simglucose.controller.base import Controller, Action
+from simglucose.simulation.sim_engine import SimObj, sim
+from simglucose.simulation.scenario import CustomScenario
 
 
 class MPCController(Controller):
-    def __init__(self, prediction_horizon=10, dt=3, target_glucose=160):
-        self.insulin = 0  # 初始胰岛素值
-        self.prev_glucose = None  # 记录上次血糖值
-        self.pred_horizon = prediction_horizon  # 预测步长
-        self.dt = dt  # 采样时间（分钟）
-        self.target_glucose = target_glucose  # 目标血糖值（ICU 目标 7.8-10.0mmol/L, 取 160mg/dL）
-        self.insulin_limits = [0, 2, 4, 5, 6]  # ICU 规定的胰岛素速率范围
-        self.p1, self.p2, self.p3, self.p4 = 0.02, 0.02, 0.0005, 0.1
+    def __init__(self, patient_model=None, prediction_horizon=10, dt=3, target_glucose=120):
+        """
+        MPC控制器初始化
+
+        参数:
+            patient_model: 患者模型参数 (可选)
+            prediction_horizon: 预测时域长度
+            dt: 控制时间间隔 (分钟)
+            target_glucose: 目标血糖值 (mg/dL)
+        """
+        self.pred_horizon = prediction_horizon
+        self.dt = dt
+        self.target = target_glucose
+        self.insulin = 0  # 当前胰岛素输注速率
+
+        # 患者特定参数 (默认使用成人#001参数)
+        self.patient_params = patient_model or {
+            'p1': 0.05,  # 葡萄糖自身清除率
+            'p2': 0.08,  # 胰岛素敏感性衰减率
+            'p3': 5e-6,  # 胰岛素对葡萄糖的影响
+            'p4': 0.1  # 胰岛素清除率
+        }
+
+        # 安全约束
+        self.insulin_min = 0  # 最小胰岛素速率 (U/h)
+        self.insulin_max = 5  # 最大胰岛素速率 (ICU典型值)
+        self.glucose_min = 70  # 低血糖阈值
+        self.glucose_max = 250  # 高血糖阈值
 
     def policy(self, observation, reward, done, **info):
-        """
-        计算最优的胰岛素剂量（basal）基于 MPC 方法
-        """
-        current_cgm = observation.CGM  # 读取 CGM 传感器的血糖值
-        optimal_insulin = self.mpc_controller(current_cgm)
-        self.insulin = optimal_insulin
+        """主控制策略"""
+        current_glucose = observation.CGM
+        optimal_insulin = self._mpc_optimization(current_glucose)
+
+        # 应用安全限制
+        self.insulin = np.clip(optimal_insulin, self.insulin_min, self.insulin_max)
         return Action(basal=self.insulin, bolus=0)
 
-    def mpc_controller(self, current_cgm):
-        """
-        使用MPC计算最佳胰岛素剂量，基于Bergman最小模型
-        """
-        N = self.pred_horizon  # 预测步长
-        u = cp.Variable(N)  # 胰岛素输入变量
-        G = cp.Variable(N + 1)  # 血糖浓度
+    def _mpc_optimization(self, current_glucose):
+        """执行MPC优化计算"""
+        N = self.pred_horizon
+
+        # 定义优化变量
+        u = cp.Variable(N)  # 胰岛素输入 (U/h)
+        G = cp.Variable(N + 1)  # 血糖预测 (mg/dL)
         X = cp.Variable(N + 1)  # 胰岛素敏感性
-        I = cp.Variable(N + 1)  # 胰岛素浓度
-        G0 = current_cgm  # 初始血糖值
-        X0, I0 = 0, 0  # 初始状态假设
+        I = cp.Variable(N + 1)  # 血浆胰岛素浓度 (mU/L)
 
-        # 约束条件
-        constraints = [G[0] == G0, X[0] == X0, I[0] == I0]
-
-        # 使用完整Bergman模型进行预测
-        for i in range(N):
-            constraints += [
-                G[i + 1] == G[i] + self.dt * (-self.p1 * G[i] - X[i] * G[i]),
-                X[i + 1] == X[i] + self.dt * (-self.p2 * X[i] + self.p3 * I[i]),
-                I[i + 1] == I[i] + self.dt * (-self.p4 * I[i] + u[i])
-            ]
-
-        # 目标函数：最小化血糖偏差 + 胰岛素使用
-        objective = cp.Minimize(
-            cp.sum_squares(G - self.target_glucose) + 0.1 * cp.sum_squares(u)
-        )
-
-        # 约束条件
-        constraints += [
-            u >= 0,  # 胰岛素不能为负
-            u <= 6,  # ICU 规定最大6U/h
-            G >= 70,  # 防止低血糖
-            G <= 250  # 防止高血糖
+        # 初始条件
+        constraints = [
+            G[0] == current_glucose,
+            X[0] == 0,  # 初始胰岛素敏感性
+            I[0] == self.insulin * 1000 / 60  # 转换U/h→mU/min→mU/L
         ]
 
-        # 根据ICU方案调整胰岛素
-        if self.prev_glucose is not None:
-            if current_cgm > 140 and current_cgm - self.prev_glucose >= 18:
-                constraints.append(u[0] >= self.insulin + 1)
-            elif current_cgm > 140 and self.prev_glucose - current_cgm >= 18:
-                constraints.append(u[0] <= self.insulin - 1)
+        # 系统动力学 (离散化Bergman最小模型)
+        for k in range(N):
+            constraints += [
+                G[k + 1] == G[k] - self.patient_params['p1'] * G[k] * self.dt - self.patient_params['p3'] * X[k] * G[
+                    k] * self.dt,
+                X[k + 1] == X[k] - self.patient_params['p2'] * X[k] * self.dt + self.patient_params['p3'] * I[
+                    k] * self.dt,
+                I[k + 1] == I[k] - self.patient_params['p4'] * I[k] * self.dt + (u[k] * 1000 / 60) * self.dt
+            ]
+
+        # 目标函数: 最小化血糖偏差 + 控制输入变化
+        objective = cp.Minimize(
+            cp.sum_squares(G - self.target) + 0.01 * cp.sum_squares(u)
+        )
+
+        # 添加约束
+        constraints += [
+            u >= self.insulin_min,
+            u <= self.insulin_max,
+            G >= self.glucose_min,
+            G <= self.glucose_max
+        ]
 
         # 求解优化问题
         prob = cp.Problem(objective, constraints)
-        prob.solve()
+        prob.solve(solver=cp.ECOS)
 
-        # 选择符合ICU方案的最优胰岛素速率
-        optimal_insulin = max(0, min(6, u.value[0]))  # 限制在 0-6 U/h
-        for limit in reversed(self.insulin_limits):
-            if optimal_insulin >= limit:
-                optimal_insulin = limit
-                break
+        if prob.status != cp.OPTIMAL:
+            print("MPC求解失败，使用上次输入")
+            return self.insulin
 
-        self.prev_glucose = current_cgm  # 记录上次血糖
-        return optimal_insulin  # 返回最优胰岛素值
+        return u.value[0]  # 仅返回第一个控制输入
 
     def reset(self):
-        """重置控制器"""
+        """重置控制器状态"""
         self.insulin = 0
-        self.prev_glucose = None
+
+
+# ===================== 仿真测试 =====================
+if __name__ == "__main__":
+    # 创建仿真环境 (选择成人患者)
+    patient = "adult#001"
+    env = T1DSimEnv(patient)
+
+    # 创建餐食场景 (7:00吃50g CHO)
+    scenario = CustomScenario(start_time=0, meals=[(7 * 60, 50)])
+
+    # 初始化MPC控制器
+    controller = MPCController(
+        prediction_horizon=10,
+        dt=3,
+        target_glucose=120
+    )
+
+    # 运行仿真
+    sim_obj = SimObj(env, controller, scenario)
+    results = sim(sim_obj, duration=24 * 60)  # 仿真24小时
+
+    # 绘制结果
+    from simglucose.analysis.report import report
+
+    report(results, title="MPC控制仿真结果")
