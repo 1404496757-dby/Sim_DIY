@@ -174,7 +174,7 @@ class RECCoGlucoseController(Controller):
         # 更新状态
         self.last_e = e
         self.last_CGM = CGM
-        self.last_action = Action(basal=basal*10, bolus=bolus*10)
+        self.last_action = Action(basal=basal, bolus=bolus)
 
         return self.last_action
 

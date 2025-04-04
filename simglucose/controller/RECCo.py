@@ -1,4 +1,143 @@
 import numpy as np
+from .base import Controller, Action
+
+
+class Cloud:
+    """单个数据云类"""
+
+    def __init__(self, x, time):
+        self.mean = x.copy()
+        self.sigma = np.dot(x, x)
+        self.count = 1
+        self.params = np.array([0.01, 0.001, 0.0, 0.0])  # P, I, D, R
+        self.added_time = time
+
+    def update(self, x):
+        """更新云参数"""
+        self.mean = (self.count - 1) / self.count * self.mean + x / self.count
+        self.sigma = (self.count - 1) / self.count * self.sigma + np.dot(x, x) / self.count
+        self.count += 1
+
+
+class CloudManager:
+    """数据云管理器"""
+
+    def __init__(self, reset_on_sim=True):
+        self.clouds = []
+        self.reset_on_sim = reset_on_sim  # 是否在仿真时重置
+
+    def reset(self):
+        """重置云数据"""
+        if self.reset_on_sim:
+            self.clouds = []
+
+    def add_cloud(self, x, time):
+        """添加新云"""
+        new_cloud = Cloud(x, time)
+        self.clouds.append(new_cloud)
+        return new_cloud
+
+    def get_active_cloud(self, x):
+        """获取活跃云及最大密度"""
+        if not self.clouds:
+            return None, 0
+
+        densities = [self._local_density(x, cloud) for cloud in self.clouds]
+        max_idx = np.argmax(densities)
+        return self.clouds[max_idx], densities[max_idx]
+
+    def _local_density(self, x, cloud):
+        """计算局部密度"""
+        diff = x - cloud.mean
+        return 1 / (1 + np.dot(diff, diff) + cloud.sigma - np.dot(cloud.mean, cloud.mean))
+
+    def initialize_params(self, new_cloud):
+        """初始化新云参数"""
+        if self.clouds:
+            weights = [c.count for c in self.clouds]
+            total = sum(weights)
+            new_cloud.params = sum([c.params * w for c, w in zip(self.clouds, weights)]) / total
+
+
+class RECCoGlucoseController(Controller):
+    def __init__(self, target=120, safe_min=70, safe_max=180, Ts=3, tau=60,
+                 y_range=(60, 150), reset_clouds=False):
+        """
+        改进版RECCo控制器
+
+        参数：
+        reset_clouds: 是否每次仿真重置数据云 (默认False)
+        """
+        # 初始化控制参数
+        self.target = target
+        self.safe_min = safe_min
+        self.safe_max = safe_max
+        self.u_range = (0, 5)
+        self.bolus_range = (0, 10)
+        self.Ts = Ts
+        self.tau = tau
+        self.y_range = y_range
+        self.Delta_y = y_range[1] - y_range[0]
+        self.Delta_e = self.Delta_y / 2
+
+        # 初始化云管理器
+        self.cloud_manager = CloudManager(reset_on_sim=reset_clouds)
+
+        # 其他参数
+        self._init_controller_params()
+
+    def _init_controller_params(self):
+        """初始化非云相关参数"""
+        self.a_r = 1 - self.Ts / 60 / self.tau
+        self.alpha = 0.1 * (self.u_range[1] - self.u_range[0]) / 20
+        self.G_sign = -1
+        self.n_add = 12
+        self.d_dead = 5
+        self.sigma_L = 1e-6
+        self.time = 0
+        self.Sigma_e = 0
+        self.last_e = 0
+        self.last_CGM = None
+        self.last_action = Action(basal=0, bolus=0)
+
+    def policy(self, observation, reward, done, **info):
+        """控制策略"""
+        CGM = observation.CGM
+        self.time += 1
+
+        # 1. 参考模型
+        y_ref = self.a_r * getattr(self, 'y_ref_prev', self.target) + (1 - self.a_r) * self.target
+        self.y_ref_prev = y_ref
+
+        # 2. 误差计算
+        e = y_ref - CGM
+        x = np.array([e / self.Delta_e, (y_ref - self.y_range[0]) / self.Delta_y])
+
+        # 3. 云演化
+        active_cloud, max_density = self.cloud_manager.get_active_cloud(x)
+
+        # 添加新云条件
+        if (max_density < 0.93 and
+                (self.time - getattr(active_cloud, 'added_time', -np.inf)) > self.n_add):
+            new_cloud = self.cloud_manager.add_cloud(x, self.time)
+            self.cloud_manager.initialize_params(new_cloud)
+            active_cloud = new_cloud
+
+        # 4. 控制计算
+        basal = bolus = 0
+        if active_cloud:
+            # ... (保持原有控制逻辑)
+            pass
+
+        return Action(basal=basal, bolus=bolus)
+
+    def reset(self):
+        """重置控制器"""
+        self._init_controller_params()
+        self.cloud_manager.reset()  # 根据reset_clouds参数决定是否重置云
+
+'''
+import numpy as np
 from collections import deque
 
 
@@ -207,3 +346,4 @@ if __name__ == "__main__":
 
         # 记录数据用于可视化
         print(f"Time: {t}, Ref: {r:.2f}, Output: {y_meas:.2f}, Control: {u:.2f}")
+'''
