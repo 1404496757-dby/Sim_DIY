@@ -62,7 +62,7 @@ class MPController(Controller):
             last_action: 上一时刻的胰岛素输注
         """
         if self.last_CGM is None:
-            self.x_est = np.array([CGM, self.patient._Ib, 0])
+            self.x_est = np.array([CGM, 0.05, 0])
         else:
             # 预测步骤
             u = np.array([last_action.basal, last_action.bolus])
@@ -134,7 +134,7 @@ class MPController(Controller):
 
         if problem.status != OPTIMAL:
             print("MPC求解失败，使用安全基础率")
-            return self.patient._basal, 0
+            return 10, 0
 
         return u_basal[0, 0].value, u_bolus[0, 0].value
 
