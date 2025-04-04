@@ -8,16 +8,18 @@ logger = logging.getLogger(__name__)
 
 
 class MPCController(Controller):
-    def __init__(self, prediction_horizon=5, control_horizon=2, A=np.array([[1]]), B=np.array([[1]]), Q=np.array([[1]]),
-                 R=np.array([[1]]), reference=140):
+    def __init__(self, prediction_horizon=5, control_horizon=2, reference=140):
         # super().__init__(init_state)
         self.prediction_horizon = prediction_horizon
         self.control_horizon = control_horizon
         # 定义模型参数
-        self.A = A  # 状态转移矩阵
-        self.B = B  # 控制输入矩阵
-        self.Q = Q  # 状态权重矩阵
-        self.R = R  # 控制输入权重矩阵
+        self.A = np.array([[0.9, -0.1],
+                    [0.05, 0.95]])  # 状态转移矩阵
+        self.B = np.array([[0.1],
+                    [0.01]])  # 控制输入矩阵
+        self.Q = np.array([[10, 0],
+                    [0, 1]])  # 状态权重矩阵
+        self.R = np.array([[0.1]])  # 控制输入权重矩阵
         self.reference = reference  # 参考血糖值
 
     def policy(self, observation, reward, done, **info):
