@@ -1,90 +1,177 @@
+import numpy as np
 from cvxpy import *
-import scipy.linalg as la
+from .base import Controller, Action
+from simglucose.simulation.env import T1DSimEnv
+from simglucose.patient.t1dpatient import T1DPatient
 
 
-class MPCController:
-    def __init__(self, patient, prediction_horizon=10, control_horizon=5):
-        self.patient = patient
+class MPController(Controller):
+    def __init__(self, patient_name='adult#001', prediction_horizon=6, control_horizon=3):
+        """
+        MPC控制器初始化
+        Args:
+            patient_name: 患者ID，用于获取模型参数
+            prediction_horizon: 预测时域(30分钟为单位)
+            control_horizon: 控制时域(30分钟为单位)
+        """
+        super().__init__()
+        self.patient = T1DPatient.withName(patient_name)
         self.N = prediction_horizon
         self.M = control_horizon
 
-        # 获取线性化模型（这里需要根据UVa/Padova模型具体实现）
-        self.A, self.B, self.C = self._linearize_model()
+        # 目标血糖范围 (mg/dL)
+        self.target = 120
+        self.safe_min = 70
+        self.safe_max = 180
 
-        # 目标血糖值 (mg/dL)
-        self.G_target = 120
+        # 控制参数
+        self.basal_max = 3 * self.patient._basal  # 最大基础率
+        self.bolus_max = 5  # 最大bolus剂量(U)
 
-        # 控制权重矩阵
-        self.Q = np.diag([1.0])  # 状态误差权重
-        self.R = np.diag([0.1])  # 控制变化权重
+        # 权重矩阵
+        self.Q = 1.0  # 血糖误差权重
+        self.R_basal = 0.1  # basal变化权重
+        self.R_bolus = 0.5  # bolus剂量权重
 
-        # 约束条件
-        self.u_min = 0  # 最小胰岛素输注率
-        self.u_max = 5  # 最大胰岛素输注率
+        # 状态空间模型 (简化UVa/Padova模型)
+        self._init_model()
 
-    def _linearize_model(self):
-        """线性化UVa/Padova模型"""
-        # 这里需要根据模型具体实现线性化
-        # 简化示例 - 实际需要根据模型方程计算雅可比矩阵
-        A = np.eye(12) * 0.9  # 示例状态矩阵
-        B = np.zeros((12, 1))
-        B[8, 0] = 1.0  # 胰岛素输入主要影响血浆胰岛素状态
-        C = np.array([[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]])  # 只观测血糖
+        # 状态估计
+        self.x_est = np.zeros(3)  # [葡萄糖, 胰岛素, 碳水化合物]
+        self.last_CGM = None
 
-        return A, B, C
+    def _init_model(self):
+        """初始化简化状态空间模型"""
+        # 这些参数需要根据UVa/Padova模型调整
+        self.A = np.array([[0.8, -0.05, 0.02],  # 葡萄糖动态
+                           [0.0, 0.9, 0.0],  # 胰岛素动态
+                           [0.0, 0.0, 0.7]])  # 碳水化合物动态
 
-    def _build_optimization_problem(self, x0):
-        """构建MPC优化问题"""
-        nx = self.A.shape[0]  # 状态维度
-        nu = self.B.shape[1]  # 输入维度
-        ny = self.C.shape[0]  # 输出维度
+        self.B = np.array([[0.0, -0.1],  # basal和bolus对葡萄糖的影响
+                           [0.1, 0.3],  # basal和bolus对胰岛素的影响
+                           [0.0, 0.0]])  # 无直接影响
+
+        self.C = np.array([[1, 0, 0]])  # 只观测葡萄糖
+
+    def _state_estimator(self, CGM, meal, last_action):
+        """
+        状态估计器 - 扩展卡尔曼滤波简化版
+        Args:
+            CGM: 当前血糖观测值
+            meal: 当前碳水化合物摄入量
+            last_action: 上一时刻的胰岛素输注
+        """
+        if self.last_CGM is None:
+            self.x_est = np.array([CGM, self.patient._Ib, 0])
+        else:
+            # 预测步骤
+            u = np.array([last_action.basal, last_action.bolus])
+            self.x_est = self.A @ self.x_est + self.B @ u
+            self.x_est[2] += meal  # 添加新摄入的碳水化合物
+
+            # 更新步骤
+            error = CGM - self.x_est[0]
+            self.x_est += np.array([0.5 * error, 0.1 * error, 0])  # 简化的卡尔曼增益
+
+        self.last_CGM = CGM
+        return self.x_est
+
+    def _mpc_optimization(self, x0, meal_announcement):
+        """
+        构建并求解MPC优化问题
+        Args:
+            x0: 初始状态
+            meal_announcement: 未来预测的碳水化合物摄入
+        Returns:
+            optimal_basal: 基础率调整(U/h)
+            optimal_bolus: 推注剂量(U)
+        """
+        nx = self.A.shape[0]
+        nu = 2  # basal和bolus
 
         # 优化变量
-        u = Variable((nu, self.M))
+        u_basal = Variable((1, self.M))
+        u_bolus = Variable((1, self.M))
         x = Variable((nx, self.N + 1))
-        y = Variable((ny, self.N))
 
         # 初始状态约束
         constraints = [x[:, 0] == x0]
 
         # 系统动态约束
         for k in range(self.N):
-            # 状态方程
-            constraints += [x[:, k + 1] == self.A @ x[:, k] + self.B @ u[:, min(k, self.M - 1)]]
+            # 控制输入 (超过控制时域后保持最后值)
+            basal = u_basal[:, min(k, self.M - 1)]
+            bolus = u_bolus[:, min(k, self.M - 1)]
+            u = np.vstack([basal, bolus])
 
-            # 输出方程
-            constraints += [y[:, k] == self.C @ x[:, k]]
+            # 状态方程
+            x_next = self.A @ x[:, k] + self.B @ u
+
+            # 添加碳水化合物影响
+            if k < len(meal_announcement):
+                x_next[2] += meal_announcement[k]
+
+            constraints += [x[:, k + 1] == x_next]
 
             # 输入约束
-            constraints += [u[:, min(k, self.M - 1)] >= self.u_min,
-                            u[:, min(k, self.M - 1)] <= self.u_max]
+            constraints += [basal >= 0, basal <= self.basal_max,
+                            bolus >= 0, bolus <= self.bolus_max]
+
+            # 安全约束 (避免低血糖)
+            constraints += [x[0, k + 1] >= self.safe_min]
 
         # 目标函数
         cost = 0
-        for k in range(self.N):
-            cost += quad_form(y[:, k] - self.G_target, self.Q)
+        for k in range(1, self.N + 1):
+            cost += self.Q * square(x[0, k] - self.target)
             if k < self.M:
-                cost += quad_form(u[:, k], self.R)
+                cost += self.R_basal * square(u_basal[:, k])
+                cost += self.R_bolus * square(u_bolus[:, k])
 
-        # 构建问题
+        # 构建并求解问题
         problem = Problem(Minimize(cost), constraints)
-
-        return problem, u
-
-    def __call__(self, observation, past_actions=None):
-        """执行MPC控制"""
-        # 从观测中提取状态（简化处理，实际需要状态估计）
-        CGM = observation.CGM
-        x0 = np.zeros((12,))  # 实际应用中需要完整状态估计
-        x0[0] = CGM  # 假设第一个状态是血糖
-
-        # 构建并求解MPC问题
-        problem, u_var = self._build_optimization_problem(x0)
         problem.solve(solver=ECOS)
 
         if problem.status != OPTIMAL:
-            print("MPC求解失败，使用基础率")
-            return self.patient._basal
+            print("MPC求解失败，使用安全基础率")
+            return self.patient._basal, 0
 
-        # 返回第一个控制动作
-        return u_var[0, 0].value
+        return u_basal[0, 0].value, u_bolus[0, 0].value
+
+    def policy(self, observation, reward, done, **info):
+        '''
+        MPC控制策略
+        ----
+        Inputs:
+        observation - 包含CGM血糖值的命名元组
+        reward      - 当前奖励值
+        done        - 是否结束标志
+        info        - 包含patient_name和sample_time等信息
+        ----
+        Output:
+        action - 包含basal和bolus的命名元组
+        '''
+        CGM = observation.CGM
+        meal = info.get('meal', 0)  # 当前碳水化合物摄入
+
+        # 获取未来餐食信息 (简化处理，实际应用中需要更精确的预测)
+        meal_announcement = [meal] + [0] * (self.N - 1)  # 假设只有当前时刻有餐食
+
+        # 状态估计
+        x0 = self._state_estimator(CGM, meal, self.last_action if hasattr(self, 'last_action') else None)
+
+        # MPC优化
+        basal, bolus = self._mpc_optimization(x0, meal_announcement)
+
+        # 创建动作
+        action = Action(basal=max(0, basal), bolus=max(0, bolus))
+        self.last_action = action  # 保存当前动作用于下次状态估计
+
+        return action
+
+    def reset(self):
+        '''重置控制器状态'''
+        self.x_est = np.zeros(3)
+        self.last_CGM = None
+        if hasattr(self, 'last_action'):
+            del self.last_action
