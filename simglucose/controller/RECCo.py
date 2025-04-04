@@ -1,166 +1,209 @@
-from .base import Controller, Action
 import numpy as np
+from collections import deque
 
 
-class RECCoController(Controller):
-    def __init__(self, target_range=(7.8, 10.0), u_range=(0, 6), Ts=60, tau=3600):
-        self.target_min, self.target_max = target_range  # 血糖目标范围 (mmol/L)
-        self.u_min, self.u_max = u_range  # 胰岛素输注范围 (U/h)
-        self.Ts = Ts  # 采样时间 (秒)
-        self.tau = tau  # 时间常数 (秒)
-        self.ar = 1 - Ts / tau  # 参考模型参数
+class RECCoController:
+    def __init__(self, u_range, y_range, tau, Ts, G_sign=1):
+        """
+        初始化RECCo控制器
 
-        # 云数据结构
-        self.clouds = []  # 每个云：[mean, mean_sq, count, params]
-        self.last_update = 0
+        参数：
+        u_range: (u_min, u_max) 控制输入范围
+        y_range: (y_min, y_max) 输出范围
+        tau: 估计的时间常数
+        Ts: 采样时间
+        G_sign: 过程增益符号（+1/-1）
+        """
+        # 系统参数
+        self.u_min, self.u_max = u_range
+        self.y_min, self.y_max = y_range
+        self.Delta_y = y_range[1] - y_range[0]
+        self.Delta_e = self.Delta_y / 2
+        self.Ts = Ts
+        self.tau = tau
 
-        # 跟踪误差相关
-        self.error_sum = 0  # 误差积分项
-        self.last_error = 0  # 上次误差
-        self.ref_model_output = None  # 参考模型输出
+        # 参考模型参数
+        self.a_r = 1 - Ts / tau
 
         # 自适应参数
-        self.alpha = 0.1 * (u_range[1] - u_range[0]) / 20  # 缩放后的自适应增益
-        self.gamma_max = 0.93  # 云添加阈值
-        self.n_add = 20  # 最小添加间隔
+        self.alpha = 0.1 * (u_range[1] - u_range[0]) / 20  # 缩放后的基础学习率
+        self.G_sign = G_sign
+        self.n_add = 20  # 添加新云的最小间隔
+        self.last_add_time = -np.inf
 
-        # ICU应急处理状态
-        self.insulin_suspended = False
+        # 数据云存储结构 [dict]
+        self.clouds = []  # 每个元素为{
+        #   'mean': 均值,
+        #   'sigma': 均方长度,
+        #   'count': 数据点数,
+        #   'params': [P, I, D, R],
+        #   'added_time': 添加时间
+        # }
 
-    def policy(self, observation, reward, done, **info):
-        bg = observation.CGM  # 当前血糖值
-        current_time = info.get('time', 0)
+        # 状态变量
+        self.Sigma_e = 0  # 误差积分
+        self.last_e = 0  # 上一次误差
+        self.last_u = 0  # 上一次控制量
+        self.time = 0  # 当前时间步
 
-        # 高低血糖应急处理
-        if bg < 4.0:
-            return self._handle_hypoglycemia()
-        elif bg > 20.0:
-            return Action(basal=0, bolus=0)  # 停止并通知医生
+        # 鲁棒性参数
+        self.d_dead = 0.05 * self.Delta_y  # 死区阈值
+        self.sigma_L = 1e-6  # 泄漏系数
 
-        # 初始化参考模型
-        if self.ref_model_output is None:
-            self.ref_model_output = bg
-
-        # 计算参考轨迹
-        target = (self.target_min + self.target_max) / 2  # 目标中值
-        self.ref_model_output = self.ar * self.ref_model_output + (1 - self.ar) * target
-
-        # 计算跟踪误差
-        error = self.ref_model_output - bg
-        delta_error = error - self.last_error
-
-        # 更新误差积分（带抗饱和）
-        if not self.insulin_suspended and self.u_min < self.current_insulin < self.u_max:
-            self.error_sum += error
-        self.last_error = error
-
-        # 构建数据点
-        x = self._normalize_data_point(error, bg)
-
-        # 云结构演化
-        self._update_cloud_structure(x, current_time)
-
-        # 计算控制信号
-        u = self._calculate_control(x, error, delta_error)
-
-        # 应用胰岛素限制
-        basal = np.clip(u, self.u_min, self.u_max)
-        return Action(basal=basal, bolus=0)
-
-    def _normalize_data_point(self, error, bg):
-        delta_y = self.target_max - self.target_min
-        delta_error = delta_y / 2
+    def _normalize(self, e, y_ref):
+        """数据标准化（公式4）"""
         return np.array([
-            error / delta_error,
-            (bg - self.target_min) / delta_y
+            e / self.Delta_e,
+            (y_ref - self.y_min) / self.Delta_y
         ])
 
-    def _update_cloud_structure(self, x, current_time):
-        if not self.clouds:
-            # 初始化第一个云
-            self.clouds.append({
-                'mean': x.copy(),
-                'mean_sq': np.dot(x, x),
-                'count': 1,
-                'params': np.zeros(4),  # [P, I, D, R]
-                'last_used': current_time
-            })
-            return
+    def _local_density(self, x, cloud):
+        """计算局部密度（公式6）"""
+        diff = x - cloud['mean']
+        return 1 / (1 + np.dot(diff, diff) + cloud['sigma'] - np.dot(cloud['mean'], cloud['mean']))
 
-        # 计算各云密度
-        densities = []
-        for cloud in self.clouds:
-            diff = x - cloud['mean']
-            density = 1 / (1 + np.dot(diff, diff) + cloud['mean_sq'] - np.dot(cloud['mean'], cloud['mean']))
-            densities.append(density)
-
-        max_density = max(densities)
-        active_idx = densities.index(max_density)
-
-        # 更新活跃云参数
-        cloud = self.clouds[active_idx]
+    def _update_cloud(self, cloud, x):
+        """更新云参数（公式7-8）"""
+        M = cloud['count']
+        cloud['mean'] = (M - 1) / M * cloud['mean'] + x / M
+        cloud['sigma'] = (M - 1) / M * cloud['sigma'] + np.dot(x, x) / M
         cloud['count'] += 1
-        cloud['mean'] = (cloud['count'] - 1) / cloud['count'] * cloud['mean'] + x / cloud['count']
-        cloud['mean_sq'] = (cloud['count'] - 1) / cloud['count'] * cloud['mean_sq'] + np.dot(x, x) / cloud['count']
-        cloud['last_used'] = current_time
+        return cloud
 
-        # 添加新云条件
-        if (max_density < self.gamma_max and
-                current_time - self.last_update > self.n_add):
-            new_params = sum(c['params'] * d for c, d in zip(self.clouds, densities)) / sum(densities)
-            self.clouds.append({
-                'mean': x.copy(),
-                'mean_sq': np.dot(x, x),
-                'count': 1,
-                'params': new_params,
-                'last_used': current_time
-            })
-            self.last_update = current_time
+    def _add_cloud(self, x):
+        """添加新云并初始化参数"""
+        new_cloud = {
+            'mean': x.copy(),
+            'sigma': np.dot(x, x),
+            'count': 1,
+            'params': self._initialize_params(),
+            'added_time': self.time
+        }
+        self.clouds.append(new_cloud)
+        return new_cloud
 
-    def _calculate_control(self, x, error, delta_error):
-        if not self.clouds:
-            return 0
+    def _initialize_params(self):
+        """初始化新云的PID-R参数"""
+        if not self.clouds:  # 第一个云
+            return np.zeros(4)
 
-        # 计算各云权重
-        densities = []
-        for cloud in self.clouds:
-            diff = x - cloud['mean']
-            density = 1 / (1 + np.dot(diff, diff) + cloud['mean_sq'] - np.dot(cloud['mean'], cloud['mean']))
-            densities.append(density)
-        weights = np.array(densities) / sum(densities)
-        # 自适应参数更新
-        for i, cloud in enumerate(self.clouds):
-            if weights[i] < 0.1:  # 只更新活跃云
-                continue
+        # 加权平均现有参数（公式12）
+        weights = [c['count'] for c in self.clouds]
+        total = sum(weights)
+        return sum([c['params'] * w for c, w in zip(self.clouds, weights)]) / total
 
-            # 带死区的参数更新
-            if abs(error) > 1.0:  # 死区阈值
-                delta_p = self.alpha * np.sign(1) * weights[i] * abs(error * error) / (1 + error ** 2)
-                delta_i = self.alpha * np.sign(1) * weights[i] * abs(error * delta_error) / (1 + error ** 2)
-                delta_r = self.alpha * np.sign(1) * weights[i] * error / (1 + error ** 2)
+    def reference_model(self, r):
+        """参考模型（公式1）"""
+        if not hasattr(self, 'y_ref_prev'):
+            self.y_ref_prev = r
+        y_ref = self.a_r * self.y_ref_prev + (1 - self.a_r) * r
+        self.y_ref_prev = y_ref
+        return y_ref
 
-                cloud['params'][0] += delta_p  # P
-                cloud['params'][1] += delta_i  # I
-                cloud['params'][3] += delta_r  # R
+    def control_step(self, y_meas, r):
+        """执行控制计算"""
+        self.time += 1
 
-        # 计算各云控制量
-        contributions = []
-        for cloud in self.clouds:
-            P, I, D, R = cloud['params']
-            u_cloud = P * error + I * self.error_sum + D * delta_error + R
-            contributions.append(u_cloud)
+        # 1. 参考模型
+        y_ref = self.reference_model(r)
+        e = y_ref - y_meas
 
-        # 加权平均
-        return np.dot(weights, contributions)
+        # 2. 数据预处理
+        x = self._normalize(e, y_ref)
+        normalized_error = e / self.Delta_e
 
-    def _handle_hypoglycemia(self):
-        self.insulin_suspended = True
-        self.error_sum = 0  # 重置积分项
-        return Action(basal=0, bolus=0)  # 停止胰岛素
+        # 3. 演化机制
+        densities=[]
+        if self.clouds:
+            densities = [self._local_density(x, c) for c in self.clouds]
+            max_density = max(densities)
+            active_idx = np.argmax(densities)
+        else:
+            max_density = 0
+            active_idx = -1
 
-    def reset(self):
-        self.clouds = []
-        self.error_sum = 0
-        self.last_error = 0
-        self.ref_model_output = None
-        self.insulin_suspended = False
+        # 判断是否需要添加新云
+        if (max_density < 0.93 and
+                (self.time - self.last_add_time) > self.n_add):
+            new_cloud = self._add_cloud(x)
+            active_idx = len(self.clouds) - 1
+            self.last_add_time = self.time
+            densities.append(0.93)  # 保证新云被选中
+
+        # 4. 参数自适应
+        if self.clouds:
+            active_cloud = self.clouds[active_idx]
+            params = active_cloud['params']
+            P, I, D, R = params
+
+            # 计算积分项和微分项
+            Delta_e = e - self.last_e
+            if self.last_u < self.u_max and self.last_u > self.u_min:
+                self.Sigma_e += e
+
+            # 自适应律（公式14）
+            if abs(e) > self.d_dead:  # 死区
+                denom = 1 + r ** 2
+                delta_P = self.alpha * self.G_sign * (abs(e * normalized_error)) / denom
+                delta_I = self.alpha * self.G_sign * (abs(e * self.Sigma_e)) / denom
+                delta_D = self.alpha * self.G_sign * (abs(e * Delta_e)) / denom
+                delta_R = self.alpha * self.G_sign * e / denom
+
+                # 泄漏（公式19）
+                params = (1 - self.sigma_L) * params + [delta_P, delta_I, delta_D, delta_R]
+
+                # 参数投影（公式18）
+                params[:3] = np.maximum(params[:3], 0)  # P,I,D >=0
+                active_cloud['params'] = params
+
+                # 5. 计算控制量
+        if self.clouds:
+            # 计算各云贡献（公式16）
+            contributions = []
+            weights = []
+            for cloud in self.clouds:
+                P, I, D, R = cloud['params']
+                u_i = P * e + I * self.Sigma_e + D * Delta_e + R
+                contributions.append(u_i)
+                weights.append(self._local_density(x, cloud))
+
+                # 加权平均
+            total_weight = sum(weights)
+            u = sum([u * w for u, w in zip(contributions, weights)]) / total_weight
+        else:
+            u = 0  # 初始状态
+
+                # 应用输入约束
+        u_clamped = np.clip(u, self.u_min, self.u_max)
+
+                # 更新状态
+        self.last_e = e
+        self.last_u = u_clamped
+
+        return u_clamped
+
+
+# 使用示例
+if __name__ == "__main__":
+    # 初始化控制器参数（示例值）
+    controller = RECCoController(
+        u_range=(0, 5),
+        y_range=(0, 10),
+        tau=40,
+        Ts=1,
+        G_sign=1
+    )
+
+    # 模拟控制循环
+    y_process = 0
+    for t in range(1000):
+        r = 5 if t < 500 else 3  # 参考信号
+        y_meas = y_process + np.random.normal(0, 0.005)  # 添加测量噪声
+
+        u = controller.control_step(y_meas, r)
+
+        # 模拟过程动态（示例的一阶系统）
+        y_process = 0.98 * y_process + 0.01 * u
+
+        # 记录数据用于可视化
+        print(f"Time: {t}, Ref: {r:.2f}, Output: {y_meas:.2f}, Control: {u:.2f}")
