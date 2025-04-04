@@ -15,6 +15,7 @@ class Viewer(object):
 
     def initialize(self):
         plt.ion()
+        plt.grid(b=True,axis='x',linestyle='--')
         fig, axes = plt.subplots(4)
 
         axes[0].set_ylabel('BG (mg/dL)')
