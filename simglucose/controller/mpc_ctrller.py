@@ -45,7 +45,7 @@ class MPCController(Controller):
             x[0] == x0,
             x[1:] == A * x[:-1] + B * u,
             u >= 0,  # 胰岛素不能为负
-            u <= 2.0,  # 胰岛素最大值约束
+            u <= 1.0,  # 胰岛素最大值约束
             x >= 70,  # 防止低血糖
             x <= 180  # 防止高血糖
         ]
@@ -55,7 +55,7 @@ class MPCController(Controller):
         prob.solve()
 
         # 返回计算出的第一步最优胰岛素值
-        return max(0, min(2.0, u.value[0]))  # 约束在 0-2.0 U/min
+        return max(0, min(1.0, u.value[0]))  # 约束在 0-2.0 U/min
 
     def reset(self):
         """重置控制器"""
