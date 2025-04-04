@@ -4,7 +4,7 @@ from .base import Controller, Action
 
 
 class MPCController(Controller):
-    def __init__(self, prediction_horizon=10, dt=5,target_glucose = 160):
+    def __init__(self, prediction_horizon=10, dt=3, target_glucose=160):
         self.insulin = 0  # 初始胰岛素值
         self.prev_glucose = None  # 记录上次血糖值
         self.pred_horizon = prediction_horizon  # 预测步长
