@@ -1,89 +1,46 @@
-import numpy as np
-from scipy import linalg
 from .base import Controller, Action
+import numpy as np
+import pandas as pd
+import pkg_resources
+import logging
+from scipy import linalg
+
+logger = logging.getLogger(__name__)
+PATIENT_PARA_FILE = pkg_resources.resource_filename(
+    'simglucose', 'params/vpatient_params.csv')
 
 
 class MPCController(Controller):
-    def __init__(self, patient_model=None, prediction_horizon=5, control_horizon=3,
-                 target=110, Q=1, R=0.1, max_insulin=5):
-        """
-        MPC Controller for glucose regulation
+    """
+    Model Predictive Controller using UVa/Padova parameters
+    """
 
-        Parameters:
-        - patient_model: Dictionary containing patient-specific model parameters
-        - prediction_horizon: Prediction horizon for MPC (in steps)
-        - control_horizon: Control horizon for MPC (in steps)
-        - target: Target blood glucose level (mg/dL)
-        - Q: State cost weight matrix
-        - R: Control cost weight matrix
-        - max_insulin: Maximum allowed insulin dose (U/min)
-        """
+    def __init__(self, target=110, prediction_horizon=5, control_horizon=3):
+        # Load patient parameters
+        self.patient_params = pd.read_csv(PATIENT_PARA_FILE)
+        self.target = target
         self.prediction_horizon = prediction_horizon
         self.control_horizon = control_horizon
-        self.target = target
-        self.Q = Q
-        self.R = R
-        self.max_insulin = max_insulin
 
-        # Default model parameters (can be replaced with patient-specific ones)
-        self.model = patient_model or self._get_default_model()
-
-        # Initialize state
-        self.x_hat = np.zeros((self.model['A'].shape[0], 1))  # State estimate
+        # Will be initialized when patient_name is known
+        self.model = None
+        self.x_hat = None
         self.last_CGM = None
+        self.last_insulin = 0
 
-    def _get_default_model(self):
-        """
-        Returns default state-space model parameters for UVa/Padova simulator
-        This is a simplified linear approximation - real model would need
-        to be identified from the simulator
-        """
-        # Discrete-time state-space model (sample time = 5 min)
-        # x[k+1] = A x[k] + B u[k] + Bd d[k]
-        # y[k] = C x[k]
+    def policy(self, observation, reward, done, **kwargs):
+        sample_time = kwargs.get('sample_time', 1)
+        pname = kwargs.get('patient_name')
 
-        # These matrices would need to be properly identified from the simulator
-        # The following are placeholder values for illustration
-        A = np.array([[0.9, 0.1, 0],
-                      [0, 0.95, 0.05],
-                      [0, 0, 0.8]])
+        # Initialize model for this patient if not already done
+        if self.model is None:
+            self._init_patient_model(pname)
 
-        B = np.array([[0.5],
-                      [0.3],
-                      [0.1]])
-
-        Bd = np.array([[0.2],
-                       [0.1],
-                       [0.05]])
-
-        C = np.array([[1, 0, 0]])
-
-        return {
-            'A': A,
-            'B': B,
-            'Bd': Bd,
-            'C': C,
-            'sample_time': 5  # minutes
-        }
-
-    def policy(self, observation, reward, done, **info):
-        """
-        MPC control policy
-
-        Inputs:
-        - observation: Namedtuple with CGM measurement (mg/dL)
-        - reward: Current reward
-        - done: Flag indicating end of episode
-        - info: Additional info including patient_name and sample_time
-
-        Returns:
-        - action: Controller action (basal, bolus)
-        """
         current_CGM = observation.CGM
 
-        # Update state estimate (simplified - would normally use a Kalman filter)
+        # Update state estimate
         if self.last_CGM is not None:
-            y = np.array([[current_CGM]])
+            y = np.array([[current_CGM - self.model['Gb']]])
             self.x_hat = self._update_state_estimate(y)
         self.last_CGM = current_CGM
 
@@ -91,35 +48,106 @@ class MPCController(Controller):
         insulin = self._compute_mpc_action(current_CGM)
 
         # Convert to simglucose action format
-        basal = max(0, min(insulin, self.max_insulin))
-        bolus = 0  # MPC only handles basal in this simple example
+        basal = max(0, min(insulin, self.model['max_insulin']))
+        bolus = 0  # MPC handles basal, bolus could be added separately
+
+        # Store last insulin for state estimation
+        self.last_insulin = basal
 
         return Action(basal=basal, bolus=bolus)
 
+    def _init_patient_model(self, patient_name):
+        """Initialize patient-specific model from parameters"""
+        if any(self.patient_params.Name.str.match(patient_name)):
+            params = self.patient_params[
+                self.patient_params.Name.str.match(patient_name)].iloc[0]
+        else:
+            # Default parameters if patient not found
+            params = self.patient_params.iloc[0]
+            logger.warning(f"Patient {patient_name} not found, using default parameters")
+
+        # Extract relevant parameters
+        BW = params.BW  # Body weight (kg)
+        Gb = params.Gb  # Basal glucose (mg/dL)
+        Ib = params.Ib  # Basal insulin (mU/L)
+        Vg = params.Vg  # Glucose distribution volume (dL/kg)
+        Vi = params.Vi  # Insulin distribution volume (L/kg)
+        u2ss = params.u2ss  # Steady-state insulin (pmol/(L*kg))
+
+        # Convert u2ss from pmol/(L*kg) to U/min
+        max_insulin = u2ss * BW / 6000 * 3  # Allow 3x basal as maximum
+
+        # Create continuous-time state-space model
+        # Using 4-state model: glucose, insulin, insulin action, and meal absorption
+        # These parameters would need to be mapped from the UVa/Padova parameters
+        p1 = 0.028735  # Glucose effectiveness (1/min)
+        p2 = params.p2u  # Insulin sensitivity (1/min)
+        p3 = 0.0003  # Rate of insulin action (1/min)
+        ke = params.ke1  # Insulin elimination rate (1/min)
+
+        # Continuous-time matrices
+        Ac = np.array([
+            [-p1, 0, -Gb * p2, 1 / (Vg * BW)],
+            [0, -ke, 0, 0],
+            [0, p3, -p3, 0],
+            [0, 0, 0, -0.05]  # Meal absorption dynamics
+        ])
+
+        Bc = np.array([
+            [0],
+            [1 / Vi],
+            [0],
+            [0]
+        ])
+
+        C = np.array([[1, 0, 0, 0]])  # Measure glucose
+
+        # Discretize with sample time = 5 min (300 sec)
+        Ts = 5 * 60
+        A = linalg.expm(Ac * Ts)
+
+        # Numerically integrate to get discrete B matrix
+        B = np.zeros_like(Bc)
+        for i in range(100):
+            B += linalg.expm(Ac * Ts * i / 100) @ Bc * (Ts / 100)
+
+        self.model = {
+            'A': A,
+            'B': B,
+            'C': C,
+            'Gb': Gb,
+            'Ib': Ib,
+            'max_insulin': max_insulin,
+            'sample_time': 5
+        }
+
+        # Initialize state estimate
+        self.x_hat = np.zeros((Ac.shape[0], 1))
+
     def _update_state_estimate(self, y):
-        """
-        Simple state estimator (would normally use Kalman filter)
-        """
-        # Simple observer - in practice would use proper state estimation
-        x_pred = self.model['A'] @ self.x_hat
-        y_pred = self.model['C'] @ x_pred
+        """Kalman filter update"""
+        A, B, C = self.model['A'], self.model['B'], self.model['C']
+
+        # Predict
+        x_pred = A @ self.x_hat + B * (self.last_insulin - self.model['Ib'])
+
+        # Update (simplified Kalman gain)
+        y_pred = C @ x_pred
         error = y - y_pred
-        L = np.array([[0.5], [0.3], [0.2]])  # Observer gain (tuned)
+        L = np.array([[0.6], [0.1], [0.2], [0.1]])  # Observer gains
 
         return x_pred + L * error
 
     def _compute_mpc_action(self, current_CGM):
-        """
-        Compute MPC action using quadratic programming
-        """
+        """Solve MPC optimization problem"""
         try:
-            from cvxpy import Variable, Minimize, Problem, norm
+            from cvxpy import Variable, Minimize, Problem, norm, ECOS, SCS
             cvxpy_available = True
         except ImportError:
             cvxpy_available = False
 
         if not cvxpy_available:
-            # Fallback to simple PID-like control if CVXPY not available
+            # Fallback to PID-like control
             error = current_CGM - self.target
             if current_CGM > 180:
                 return 0.05 * error
@@ -130,49 +158,91 @@ class MPCController(Controller):
             else:
                 return 0
 
-        # Setup MPC optimization problem using CVXPY
+            # 添加血糖安全检查
+        if current_CGM < 80:  # 低血糖保护
+            return 0
+        # Setup MPC optimization
         A, B, C = self.model['A'], self.model['B'], self.model['C']
-        nx, nu = B.shape  # state and input dimensions
-
-        # Initialize variables
+        nx, nu = B.shape
         x = Variable((nx, self.prediction_horizon + 1))
         u = Variable((nu, self.prediction_horizon))
-
-        # Initial state
+        # 放宽约束条件，提高数值稳定性
         constraints = [x[:, 0] == self.x_hat.flatten()]
-
-        # System dynamics constraints
         for k in range(self.prediction_horizon):
-            constraints += [x[:, k + 1] == A @ x[:, k] + B @ u[:, k]]
-
-        # Control constraints
-        for k in range(self.prediction_horizon):
-            constraints += [u[:, k] >= 0, u[:, k] <= self.max_insulin]
-
-        # Cost function
+            constraints += [
+                x[:, k + 1] == A @ x[:, k] + B @ u[:, k],
+                u[:, k] >= -self.model['Ib'],
+                u[:, k] <= self.model['max_insulin'] - self.model['Ib']
+            ]
+        # 修改成本函数，增加正则化项
         cost = 0
         for k in range(self.prediction_horizon):
-            # Tracking error cost
-            cost += self.Q * (C @ x[:, k] - self.target) ** 2
-            # Control effort cost
-            cost += self.R * (u[:, k]) ** 2
-
-        # Terminal cost
-        cost += 10 * self.Q * (C @ x[:, self.prediction_horizon] - self.target) ** 2
-
-        # Solve optimization problem
+            # 增加血糖偏差惩罚
+            glucose_error = C @ x[:, k] + self.model['Gb'] - self.target
+            cost += 100 * glucose_error ** 2
+            # 增加控制输入惩罚
+            cost += 1.0 * (u[:, k] + self.model['Ib']) ** 2
+            # 如果不是第一步，增加控制变化率惩罚
+            if k > 0:
+                cost += 5.0 * (u[:, k] - u[:, k - 1]) ** 2
+        # 创建问题
         prob = Problem(Minimize(cost), constraints)
-        prob.solve(solver='ECOS')
+        # 尝试不同的求解器
+        try:
+            # 首先尝试OSQP（默认）
+            prob.solve(solver='OSQP', eps_abs=1e-3, eps_rel=1e-3, max_iter=10000, verbose=False)
+        except Exception as e1:
+            try:
+                # 如果OSQP失败，尝试ECOS
+                prob.solve(solver=ECOS, verbose=False)
+            except Exception as e2:
+                try:
+                    # 如果ECOS也失败，尝试SCS
+                    prob.solve(solver=SCS, verbose=False)
+                except Exception as e3:
+                    # 所有求解器都失败，使用备用控制策略
+                    logger.warning(f"All solvers failed: {e1}, {e2}, {e3}")
+                    # 简单的PID控制作为备用
+                    error = current_CGM - self.target
+                    if current_CGM > 180:
+                        return min(0.05 * error, self.model['max_insulin'])
+                    elif current_CGM > 140:
+                        return min(0.02 * error, self.model['max_insulin'])
+                    elif current_CGM < 80:
+                        return 0
+                    else:
+                        return 0
+        # 检查求解状态
+        if prob.status not in ['optimal', 'optimal_inaccurate']:
+            logger.warning(f"Solver status: {prob.status}")
+            # 使用备用控制策略
+            error = current_CGM - self.target
+            if current_CGM > 180:
+                return min(0.05 * error, self.model['max_insulin'])
+            elif current_CGM > 140:
+                return min(0.02 * error, self.model['max_insulin'])
+            elif current_CGM < 80:
+                return 0
+            else:
+                return 0
+        # 获取最优控制输入
+        try:
+            insulin = max(0, u[:, 0].value[0] + self.model['Ib'])
+            # 添加血糖安全检查
+            if current_CGM < 80:  # 低血糖保护
+                insulin = 0
+            elif current_CGM < 100:  # 接近低血糖
+                insulin = insulin * 0.5  # 减少胰岛素剂量
+            return insulin
+        except:
+            logger.warning("Failed to extract solution value")
+            return 0
 
-        if prob.status != 'optimal':
-            return 0  # Fallback to no insulin if optimization fails
-
-        # Return first control action (according to MPC principle)
-        return u[:, 0].value[0]
+        return max(0, u[:, 0].value[0] + self.model['Ib'])
 
     def reset(self):
-        """
-        Reset controller state
-        """
-        self.x_hat = np.zeros((self.model['A'].shape[0], 1))
+        """Reset controller state"""
+        if self.model is not None:
+            self.x_hat = np.zeros((self.model['A'].shape[0], 1))
         self.last_CGM = None
+        self.last_insulin = 0

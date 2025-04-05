@@ -52,6 +52,75 @@ class CloudManager:
         """获取上次添加云的时间"""
         return self.last_add_time
 
+    def get_cloud_info(self, detailed=False):
+        """
+        获取云数据的信息
+
+        参数:
+        detailed -- 是否返回详细信息，默认为False
+
+        返回:
+        cloud_info -- 包含云数据信息的字典或列表
+        """
+        if not self.clouds:
+            return "没有云数据"
+
+        if not detailed:
+            # 返回简要信息
+            return {
+                "云数量": len(self.clouds),
+                "当前时间步": self.time,
+                "上次添加时间": self.last_add_time
+            }
+
+        # 返回详细信息
+        cloud_details = []
+        for i, cloud in enumerate(self.clouds):
+            cloud_info = {
+                "云索引": i,
+                "添加时间": cloud['added_time'],
+                "样本数": cloud['count'],
+                "均值": cloud['mean'].tolist(),
+                "参数": {
+                    "P": cloud['params'][0],
+                    "I": cloud['params'][1],
+                    "D": cloud['params'][2],
+                    "R": cloud['params'][3]
+                }
+            }
+            cloud_details.append(cloud_info)
+
+        return cloud_details
+
+    def print_cloud_info(self, detailed=False):
+        """
+        打印云数据信息
+
+        参数:
+        detailed -- 是否打印详细信息，默认为False
+        """
+        info = self.get_cloud_info(detailed)
+
+        if isinstance(info, str):
+            print(info)
+            return
+
+        if not detailed:
+            print(f"云数量: {info['云数量']}")
+            print(f"当前时间步: {info['当前时间步']}")
+            print(f"上次添加时间: {info['上次添加时间']}")
+            return
+
+        print(f"总云数量: {len(info)}")
+        for cloud_info in info:
+            print("\n" + "=" * 40)
+            print(f"云索引: {cloud_info['云索引']}")
+            print(f"添加时间: {cloud_info['添加时间']}")
+            print(f"样本数: {cloud_info['样本数']}")
+            print(f"均值: {cloud_info['均值']}")
+            print("PID-R参数:")
+            for param, value in cloud_info['参数'].items():
+                print(f"  {param}: {value:.6f}")
 
 class RECCoGlucoseController(Controller):
     def __init__(self, target=120, safe_min=70, safe_max=180, Ts=3, tau=60, y_range=(60, 150)):
@@ -219,6 +288,27 @@ class RECCoGlucoseController(Controller):
         self.last_action = Action(basal=basal, bolus=bolus)
 
         return self.last_action
+
+    def get_cloud_info(self, detailed=False):
+        """
+        获取云数据信息
+
+        参数:
+        detailed -- 是否返回详细信息，默认为False
+
+        返回:
+        cloud_info -- 包含云数据信息的字典或列表
+        """
+        return self.cloud_manager.get_cloud_info(detailed)
+
+    def print_cloud_info(self, detailed=False):
+        """
+        打印云数据信息
+
+        参数:
+        detailed -- 是否打印详细信息，默认为False
+        """
+        self.cloud_manager.print_cloud_info(detailed)
 
     def reset(self):
         """重置控制器状态，但不重置云数据"""
