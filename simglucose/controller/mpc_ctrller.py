@@ -75,7 +75,7 @@ class MPCController(Controller):
         u2ss = params.u2ss  # Steady-state insulin (pmol/(L*kg))
 
         # Convert u2ss from pmol/(L*kg) to U/min
-        max_insulin = u2ss * BW / 6000 * 3  # Allow 3x basal as maximum
+        max_insulin = u2ss * BW / 6000 * 5  # Allow 3x basal as maximum
 
         # Create continuous-time state-space model
         # Using 4-state model: glucose, insulin, insulin action, and meal absorption
@@ -179,7 +179,11 @@ class MPCController(Controller):
         for k in range(self.prediction_horizon):
             # 增加血糖偏差惩罚
             glucose_error = C @ x[:, k] + self.model['Gb'] - self.target
-            cost += 100 * glucose_error ** 2
+            if glucose_error < 0:
+                cost += 200 * glucose_error ** 2
+            else:
+                cost += 100 * glucose_error ** 2
+
             # 增加控制输入惩罚
             cost += 1.0 * (u[:, k] + self.model['Ib']) ** 2
             # 如果不是第一步，增加控制变化率惩罚
@@ -233,6 +237,12 @@ class MPCController(Controller):
                 insulin = 0
             elif current_CGM < 100:  # 接近低血糖
                 insulin = insulin * 0.5  # 减少胰岛素剂量
+            elif current_CGM > 180:
+                min_insulin = min(0.5, self.model['max_insulin'])
+                insulin = max(insulin, min_insulin)
+            elif current_CGM > 150:
+                min_insulin = min(0.2, self.model['max_insulin'])
+                insulin = max(insulin, min_insulin)
             return insulin
         except:
             logger.warning("Failed to extract solution value")
