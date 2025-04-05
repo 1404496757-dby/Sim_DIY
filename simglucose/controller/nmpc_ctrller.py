@@ -6,7 +6,7 @@ from simglucose.simulation.env import T1DSimEnv
 
 
 class NMPCController(Controller):
-    def __init__(self, patient_model, prediction_horizon=6, control_horizon=3):
+    def __init__(self, prediction_horizon=6, control_horizon=3):
         self.Ts = 3  # 采样时间（分钟）
         self.N = prediction_horizon  # 预测时域
         self.M = control_horizon  # 控制时域
