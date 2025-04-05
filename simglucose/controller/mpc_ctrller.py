@@ -141,7 +141,7 @@ class MPCController(Controller):
     def _compute_mpc_action(self, current_CGM):
         """Solve MPC optimization problem"""
         try:
-            from cvxpy import Variable, Minimize, Problem, norm, ECOS, SCS
+            from cvxpy import Variable, Minimize, Problem, norm, ECOS, SCS, maximum
             cvxpy_available = True
         except ImportError:
             cvxpy_available = False
@@ -187,7 +187,7 @@ class MPCController(Controller):
             glucose_error = C @ x[:, k] + self.model['Gb'] - self.target
             # 使用两个不同的权重，但避免使用严格不等式
             cost += 100 * glucose_error ** 2  # 基础惩罚
-            cost += 100 * (glucose_error <= 0) @ (glucose_error ** 2)  # 高血糖额外惩罚
+            cost += 100 * maximum(0, -glucose_error) ** 2  # 高血糖额外惩罚
 
             # 增加控制输入惩罚
             cost += 0.5 * (u[:, k] + self.model['Ib']) ** 2  # 减小惩罚权重
