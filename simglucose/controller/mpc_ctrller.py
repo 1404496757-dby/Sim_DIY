@@ -146,6 +146,7 @@ class MPCController(Controller):
         except ImportError:
             cvxpy_available = False
 
+
         if not cvxpy_available:
             # Fallback to PID-like control
             error = current_CGM - self.target
@@ -154,18 +155,21 @@ class MPCController(Controller):
             elif current_CGM > 140:
                 return 0.02 * error
             elif current_CGM < 70:
-                return -0.01 * error
+                return 0
             else:
+
                 return 0
 
-            # 添加血糖安全检查
+        # 添加血糖安全检查
         if current_CGM < 80:  # 低血糖保护
             return 0
+
         # Setup MPC optimization
         A, B, C = self.model['A'], self.model['B'], self.model['C']
         nx, nu = B.shape
         x = Variable((nx, self.prediction_horizon + 1))
         u = Variable((nu, self.prediction_horizon))
+
         # 放宽约束条件，提高数值稳定性
         constraints = [x[:, 0] == self.x_hat.flatten()]
         for k in range(self.prediction_horizon):
@@ -174,23 +178,27 @@ class MPCController(Controller):
                 u[:, k] >= -self.model['Ib'],
                 u[:, k] <= self.model['max_insulin'] - self.model['Ib']
             ]
+
         # 修改成本函数，增加正则化项
         cost = 0
         for k in range(self.prediction_horizon):
-            # 增加血糖偏差惩罚
+            # 增加血糖偏差惩罚 - 修复严格不等式问题
+
             glucose_error = C @ x[:, k] + self.model['Gb'] - self.target
-            if glucose_error < 0:
-                cost += 200 * glucose_error ** 2
-            else:
-                cost += 100 * glucose_error ** 2
+            # 使用两个不同的权重，但避免使用严格不等式
+            cost += 100 * glucose_error ** 2  # 基础惩罚
+            cost += 100 * (glucose_error <= 0) @ (glucose_error ** 2)  # 高血糖额外惩罚
 
             # 增加控制输入惩罚
-            cost += 1.0 * (u[:, k] + self.model['Ib']) ** 2
+            cost += 0.5 * (u[:, k] + self.model['Ib']) ** 2  # 减小惩罚权重
+
             # 如果不是第一步，增加控制变化率惩罚
             if k > 0:
                 cost += 5.0 * (u[:, k] - u[:, k - 1]) ** 2
+
         # 创建问题
         prob = Problem(Minimize(cost), constraints)
+
         # 尝试不同的求解器
         try:
             # 首先尝试OSQP（默认）
@@ -209,30 +217,32 @@ class MPCController(Controller):
                     # 简单的PID控制作为备用
                     error = current_CGM - self.target
                     if current_CGM > 180:
-                        return min(0.05 * error, self.model['max_insulin'])
+                        return min(0.5 + 0.05 * error, self.model['max_insulin'])
                     elif current_CGM > 140:
-                        return min(0.02 * error, self.model['max_insulin'])
+                        return min(0.2 + 0.02 * error, self.model['max_insulin'])
                     elif current_CGM < 80:
                         return 0
                     else:
-                        return 0
+                        return min(0.1, self.model['max_insulin'])
+
         # 检查求解状态
         if prob.status not in ['optimal', 'optimal_inaccurate']:
             logger.warning(f"Solver status: {prob.status}")
             # 使用备用控制策略
             error = current_CGM - self.target
             if current_CGM > 180:
-                return min(0.05 * error, self.model['max_insulin'])
+                return min(0.5 + 0.05 * error, self.model['max_insulin'])
             elif current_CGM > 140:
-                return min(0.02 * error, self.model['max_insulin'])
+                return min(0.2 + 0.02 * error, self.model['max_insulin'])
             elif current_CGM < 80:
                 return 0
             else:
-                return 0
+                return min(0.1, self.model['max_insulin'])
+
         # 获取最优控制输入
         try:
             insulin = max(0, u[:, 0].value[0] + self.model['Ib'])
-            # 添加血糖安全检查
+
             if current_CGM < 80:  # 低血糖保护
                 insulin = 0
             elif current_CGM < 100:  # 接近低血糖
@@ -243,7 +253,6 @@ class MPCController(Controller):
             elif current_CGM > 150:
                 min_insulin = min(0.2, self.model['max_insulin'])
                 insulin = max(insulin, min_insulin)
-            return insulin
         except:
             logger.warning("Failed to extract solution value")
             return 0
