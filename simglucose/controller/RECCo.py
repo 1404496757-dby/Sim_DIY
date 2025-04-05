@@ -227,7 +227,7 @@ class CloudManager:
 
 
 class RECCoGlucoseController(Controller):
-    def __init__(self, target=160, safe_min=140, safe_max=180, Ts=3, tau=40, y_range=(70, 250)):
+    def __init__(self, target=120, safe_min=60, safe_max=180, Ts=3, tau=40, y_range=(60, 150)):
         """
         针对血糖控制的RECCo控制器
 
@@ -242,8 +242,8 @@ class RECCoGlucoseController(Controller):
         self.safe_max = safe_max  # 高血糖阈值
 
         # 控制输入范围 (U/h)
-        self.u_range = (0, 6)  # 基础率范围
-        self.bolus_range = (0, 14)  # 推注剂量范围
+        self.u_range = (0, 5)  # 基础率范围
+        self.bolus_range = (0, 10)  # 推注剂量范围
 
         # 时间参数 (分钟)
         self.Ts = Ts  # simglucose默认采样时间
@@ -261,12 +261,6 @@ class RECCoGlucoseController(Controller):
         # 状态变量
         self.last_CGM = None
         self.last_action = Action(basal=0, bolus=0)
-
-        # ICU血糖监控相关变量
-        self.consecutive_high_count = 0  # 连续高血糖次数
-        self.last_monitoring_time = 0  # 上次监测时间
-        self.monitoring_interval = 360  # 监测间隔(分钟)，默认6小时
-        self.stable_days = 0  # 稳定天数
 
     def _init_recco_params(self):
         """初始化RECCo核心参数"""
@@ -321,18 +315,6 @@ class RECCoGlucoseController(Controller):
         CGM = observation.CGM
         self.cloud_manager.increment_time()
 
-        # 更新监测间隔
-        current_time = self.cloud_manager.get_time() * self.Ts  # 当前时间(分钟)
-        time_since_last = current_time - self.last_monitoring_time
-
-        # 判断是否需要监测血糖
-        if time_since_last < self.monitoring_interval and self.last_CGM is not None:
-            # 未到监测时间，返回上次的控制动作
-            return self.last_action
-
-        # 记录本次监测时间
-        self.last_monitoring_time = current_time
-
         # 1. 参考模型
         if not hasattr(self, 'y_ref_prev'):
             self.y_ref_prev = self.target
@@ -372,81 +354,7 @@ class RECCoGlucoseController(Controller):
 
         # 5. 参数自适应
         basal = bolus = 0
-
-        if CGM > 180:  # > 10.0 mmol/L
-            # 更新连续高血糖计数
-            self.consecutive_high_count += 1
-
-            # 根据ICU指南确定胰岛素用量
-            if self.consecutive_high_count >= 2:  # 连续两次超过10.0 mmol/L
-                # 使用静脉泵入方案
-                if 180 < CGM <= 234:  # 10.0-13.0 mmol/L
-                    basal = 2
-                elif 234 < CGM <= 306:  # 13.1-17.0 mmol/L
-                    basal = 4
-                elif 306 < CGM <= 360:  # 17.1-20.0 mmol/L
-                    basal = 5
-                else:  # > 20.0 mmol/L
-                    basal = 6
-                    logger.warning(f"血糖过高: {CGM} mg/dL (>20.0 mmol/L), 请通知医生")
-
-                # 根据血糖变化调整胰岛素用量
-                if self.last_CGM is not None:
-                    bg_change = CGM - self.last_CGM
-                    if bg_change > 18:  # 上升超过1 mmol/L
-                        basal += 1
-                    elif bg_change < -18:  # 下降超过1 mmol/L
-                        basal = max(0, basal - 1)
-            else:
-                # 单次血糖升高，使用皮下注射方案
-                if 180 < CGM <= 234:  # 10.1-13.0 mmol/L
-                    bolus = 4
-                elif 234 < CGM <= 306:  # 13.1-17.0 mmol/L
-                    bolus = 6
-                elif 306 < CGM <= 324:  # 17.1-18.0 mmol/L
-                    bolus = 8
-                elif 324 < CGM <= 360:  # 18.1-20.0 mmol/L
-                    bolus = 10
-                else:  # > 20.0 mmol/L
-                    bolus = 14
-                    logger.warning(f"血糖过高: {CGM} mg/dL (>20.0 mmol/L), 请通知医生")
-        else:
-            # 重置连续高血糖计数
-            self.consecutive_high_count = 0
-
-            # 低血糖处理
-            if CGM < 140:  # < 7.8 mmol/L
-                basal = 0
-                bolus = 0
-                logger.info(f"血糖低于目标范围: {CGM} mg/dL (<7.8 mmol/L), 停止胰岛素")
-
-                if CGM < 72:  # < 4.0 mmol/L
-                    logger.warning(f"低血糖: {CGM} mg/dL (<4.0 mmol/L), 需要50%GS 20ml静脉推注")
-
-            # 血糖稳定处理
-            if 140 <= CGM <= 180:  # 7.8-10.0 mmol/L
-                # 计算稳定天数
-                if self.last_CGM is not None and self.last_CGM <= 180:
-                    # 一天约288个5分钟采样点
-                    self.stable_days += self.Ts / (24 * 60)
-
-                    # 连续2天血糖稳定，可以减少监测频率
-                    if self.stable_days >= 2:
-                        self.monitoring_interval = 720  # 12小时
-                else:
-                    self.stable_days = 0
-                    self.monitoring_interval = 360  # 6小时
-
-            # 如果血糖恢复到目标范围，重新开始胰岛素时减半
-        if self.last_CGM is not None and self.last_CGM < 140 and CGM > 180:
-            basal = basal / 2
-            bolus = bolus / 2
-
-            # 确保在允许范围内
-        basal = np.clip(basal, *self.u_range)
-        bolus = np.clip(bolus, *self.bolus_range)
-
-        if clouds and active_idx >= 0:
+        if clouds:
             active_cloud = clouds[active_idx]
             P, I, D, R = active_cloud['params']
 
@@ -473,21 +381,16 @@ class RECCoGlucoseController(Controller):
                 self.cloud_manager.update_cloud(active_idx, new_params=new_params, increment_count=False)
 
             # 6. 计算控制量 (分开计算basal和bolus)
-            # 计算RECCo控制量
-            recco_basal = np.clip(P * e + I * self.Sigma_e + R, *self.u_range)
-            recco_bolus = np.clip(D * Delta_e + (0.1 if e > 20 else 0), *self.bolus_range)
-            # 将RECCo控制与ICU方案融合（权重为0.3）
-            if basal > 0:
-                basal = 0.7 * basal + 0.3 * recco_basal
-            if bolus > 0:
-                bolus = 0.7 * bolus + 0.3 * recco_bolus
+            # basal基于长期误差 (P和I项)
+            basal = np.clip(P * e + I * self.Sigma_e + R, *self.u_range)
 
-            '''
+            # bolus基于短期变化 (D项和紧急校正)
+            bolus = np.clip(D * Delta_e + (0.1 if e > 20 else 0), *self.bolus_range)
+
             # 低血糖保护
             if CGM < 80:
                 basal = 0
                 bolus = 0
-            '''
 
         # 更新状态
         self.last_e = e
@@ -495,35 +398,6 @@ class RECCoGlucoseController(Controller):
         self.last_action = Action(basal=basal, bolus=bolus)
 
         return self.last_action
-
-    def set_monitoring_schedule(self, patient_status):
-        """
-        根据患者状态设置血糖监测间隔
-
-        参数:
-        patient_status: 字符串，可以是 'initial'(入ICU初期), 'post_op'(普通术后),
-                       'oral_diet'(口服饮食), 'nutrition'(肠内外营养), 'stable'(稳定)
-        """
-        if patient_status == 'initial':
-            # 入ICU 12-24h，每1-2小时监测
-            self.monitoring_interval = 60  # 1小时
-        elif patient_status == 'post_op':
-            # 普通术后，每6小时监测
-            self.monitoring_interval = 360  # 6小时
-        elif patient_status == 'oral_diet':
-            # 口服饮食，每天4次
-            self.monitoring_interval = 360  # 6小时，实际应该在进食前1小时和晚12点
-        elif patient_status == 'nutrition':
-            # 肠内外营养，每6小时
-            self.monitoring_interval = 360  # 6小时
-        elif patient_status == 'stable':
-            # 连续2天血糖稳定，每12小时
-            self.monitoring_interval = 720  # 12小时
-        else:
-            # 默认每6小时
-            self.monitoring_interval = 360  # 6小时
-
-        return self.monitoring_interval
 
     def get_cloud_info(self, detailed=False):
         """
@@ -559,11 +433,5 @@ class RECCoGlucoseController(Controller):
         self.last_e = 0
         if hasattr(self, 'y_ref_prev'):
             delattr(self, 'y_ref_prev')
-
-        # 重置ICU相关变量
-        self.consecutive_high_count = 0
-        self.last_monitoring_time = 0
-        self.stable_days = 0
-        self.monitoring_interval = 360  # 默认6小时
 
         self.save_cloud_data()
