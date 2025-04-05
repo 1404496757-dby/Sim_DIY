@@ -31,6 +31,7 @@ class MPCController(Controller):
     def policy(self, observation, reward, done, **kwargs):
         sample_time = kwargs.get('sample_time', 1)
         pname = kwargs.get('patient_name')
+        meal = kwargs.get('meal', 0)  # 获取餐食信息
 
         # Initialize model for this patient if not already done
         if self.model is None:
@@ -47,12 +48,30 @@ class MPCController(Controller):
         # Calculate MPC action
         insulin = self._compute_mpc_action(current_CGM)
 
+        # 低血糖安全保护
+        if current_CGM < 80:  # 低血糖保护
+            insulin = 0
+        elif current_CGM < 100:  # 接近低血糖
+            insulin = insulin * 0.5  # 减少胰岛素剂量
+        elif current_CGM > 180:
+            min_insulin = min(0.5, self.model['max_insulin'])
+            insulin = max(insulin, min_insulin)
+        elif current_CGM > 150:
+            min_insulin = min(0.2, self.model['max_insulin'])
+            insulin = max(insulin, min_insulin)
+
         # Convert to simglucose action format
         basal = max(0, min(insulin, self.model['max_insulin']))
-        bolus = 0  # MPC handles basal, bolus could be added separately
+
+        # 处理餐食胰岛素
+        bolus = 0
+        if meal > 10:  # 大于10g的碳水被视为餐食
+            # 简单的餐前胰岛素计算 (碳水/胰岛素比例约为10:1)
+            bolus = meal / 10 * 0.5  # 每10g碳水给予0.5U胰岛素
+            bolus = min(bolus, 5.0)  # 限制最大bolus
 
         # Store last insulin for state estimation
-        self.last_insulin = basal
+        self.last_insulin = basal + bolus
 
         return Action(basal=basal, bolus=bolus)
 
@@ -146,19 +165,17 @@ class MPCController(Controller):
         except ImportError:
             cvxpy_available = False
 
-
         if not cvxpy_available:
             # Fallback to PID-like control
             error = current_CGM - self.target
             if current_CGM > 180:
-                return 0.05 * error
+                return min(0.5 + 0.05 * error, self.model['max_insulin'])
             elif current_CGM > 140:
-                return 0.02 * error
+                return min(0.2 + 0.02 * error, self.model['max_insulin'])
             elif current_CGM < 70:
                 return 0
             else:
-
-                return 0
+                return min(0.1, self.model['max_insulin'])
 
         # 添加血糖安全检查
         if current_CGM < 80:  # 低血糖保护
@@ -242,17 +259,7 @@ class MPCController(Controller):
         # 获取最优控制输入
         try:
             insulin = max(0, u[:, 0].value[0] + self.model['Ib'])
-
-            if current_CGM < 80:  # 低血糖保护
-                insulin = 0
-            elif current_CGM < 100:  # 接近低血糖
-                insulin = insulin * 0.5  # 减少胰岛素剂量
-            elif current_CGM > 180:
-                min_insulin = min(0.5, self.model['max_insulin'])
-                insulin = max(insulin, min_insulin)
-            elif current_CGM > 150:
-                min_insulin = min(0.2, self.model['max_insulin'])
-                insulin = max(insulin, min_insulin)
+            return insulin
         except:
             logger.warning("Failed to extract solution value")
             return 0

@@ -35,7 +35,7 @@ class Viewer(object):
 
         axes[0].set_ylim([70, 180])
         axes[1].set_ylim([-5, 30])
-        axes[2].set_ylim([-0.5, 1])
+        axes[2].set_ylim([-0.5, 0.5])
         axes[3].set_ylim([0, 5])
 
         for ax in axes:

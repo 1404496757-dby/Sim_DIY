@@ -227,7 +227,7 @@ class CloudManager:
 
 
 class RECCoGlucoseController(Controller):
-    def __init__(self, target=120, safe_min=60, safe_max=180, Ts=3, tau=40, y_range=(60, 150)):
+    def __init__(self, target=120, safe_min=140, safe_max=180, Ts=3, tau=40, y_range=(70, 180)):
         """
         针对血糖控制的RECCo控制器
 
@@ -381,21 +381,29 @@ class RECCoGlucoseController(Controller):
                 self.cloud_manager.update_cloud(active_idx, new_params=new_params, increment_count=False)
 
             # 6. 计算控制量 (分开计算basal和bolus)
-            # basal基于长期误差 (P和I项)
-            basal = np.clip(P * e + I * self.Sigma_e + R, *self.u_range)
-
-            # bolus基于短期变化 (D项和紧急校正)
-            bolus = np.clip(D * Delta_e + (0.1 if e > 20 else 0), *self.bolus_range)
-
-            # 低血糖保护
-            if CGM < 80:
-                basal = 0
-                bolus = 0
+            basal_raw = P * e + I * self.Sigma_e + D * Delta_e + R
+            # 低血糖安全保护
+            if CGM < 80:  # 低血糖保护
+                basal_raw = 0
+            elif CGM < 100 and e < 0:  # 接近低血糖且血糖仍在下降
+                basal_raw = basal_raw * 0.5  # 减少胰岛素剂量
+            # 限制在允许范围内
+            basal = max(self.u_range[0], min(basal_raw, self.u_range[1]))
+            # 大餐时的额外胰岛素 (bolus)
+            bolus = 0  # 默认不使用bolus
+            # 如果info中包含meal信息，可以考虑添加餐前胰岛素
+            if 'meal' in info and info['meal'] > 10:  # 大于10g的碳水被视为餐食
+                # 简单的餐前胰岛素计算 (碳水/胰岛素比例约为10:1)
+                bolus = info['meal'] / 10 * 0.5  # 每10g碳水给予0.5U胰岛素
+                bolus = min(bolus, 5.0)  # 限制最大bolus
 
         # 更新状态
         self.last_e = e
-        self.last_CGM = CGM
+        # self.last_CGM = CGM
         self.last_action = Action(basal=basal, bolus=bolus)
+
+        if current_time % 20 == 0:
+            self.save_cloud_data()
 
         return self.last_action
 
