@@ -270,7 +270,7 @@ class RECCoGlucoseController(Controller):
         # 自适应参数
         self.alpha = 0.1 * (self.u_range[1] - self.u_range[0]) / 20
         self.G_sign = -1  # 胰岛素对血糖是负影响
-        self.n_add = 12  # 5分钟采样，20个样本约1.5小时
+        self.n_add = 20  # 5分钟采样，20个样本约1.5小时
 
         # 误差积分
         self.Sigma_e = 0
@@ -299,7 +299,8 @@ class RECCoGlucoseController(Controller):
         clouds = self.cloud_manager.get_clouds()
         if not clouds:
             # 初始参数基于临床经验
-            return np.array([0.01, 0.001, 0.0, 0.0])  # P, I, D, R
+            # return np.array([0.01, 0.001, 0.0, 0.0])  # P, I, D, R
+            return np.array([0.0, 0.0, 0.0, 0.0])  # P, I, D, R
 
         # 加权平均现有参数
         weights = [c['count'] for c in clouds]
@@ -383,9 +384,9 @@ class RECCoGlucoseController(Controller):
             # 6. 计算控制量 (分开计算basal和bolus)
             basal_raw = P * e + I * self.Sigma_e + D * Delta_e + R
             # 低血糖安全保护
-            if CGM < 80:  # 低血糖保护
+            if CGM < 140:  # 低血糖保护
                 basal_raw = 0
-            elif CGM < 100 and e < 0:  # 接近低血糖且血糖仍在下降
+            elif CGM < 160 and e < 0:  # 接近低血糖且血糖仍在下降
                 basal_raw = basal_raw * 0.5  # 减少胰岛素剂量
             # 限制在允许范围内
             basal = max(self.u_range[0], min(basal_raw, self.u_range[1]))
