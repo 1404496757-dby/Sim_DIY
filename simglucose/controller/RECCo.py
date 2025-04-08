@@ -299,8 +299,8 @@ class RECCoGlucoseController(Controller):
         clouds = self.cloud_manager.get_clouds()
         if not clouds:
             # 初始参数基于临床经验
-            # return np.array([0.01, 0.001, 0.0, 0.0])  # P, I, D, R
-            return np.array([0.0, 0.0, 0.0, 0.0])  # P, I, D, R
+            return np.array([0.01, 0.001, 0.0, 0.0])  # P, I, D, R
+            # return np.array([0.0, 0.0, 0.0, 0.0])  # P, I, D, R
 
         # 加权平均现有参数
         weights = [c['count'] for c in clouds]
@@ -368,14 +368,14 @@ class RECCoGlucoseController(Controller):
             # 自适应律 (仅当误差较大时)
             if abs(e) > self.d_dead:
                 denom = 1 + self.target ** 2
-                # delta_P = self.alpha * self.G_sign * abs(e * (e / self.Delta_e)) / denom
-                # delta_I = self.alpha * self.G_sign * abs(e * self.Sigma_e) / denom
-                # delta_D = self.alpha * self.G_sign * abs(e * Delta_e) / denom
-                # delta_R = self.alpha * self.G_sign * e / denom
-                delta_P = self.alpha * self.G_sign * abs(E * e) / denom
-                delta_I = self.alpha * self.G_sign * abs(E * Delta_e) / denom
-                delta_D = self.alpha * self.G_sign * abs(E * Delta_e) / denom
-                delta_R = self.alpha * self.G_sign * E / denom
+                delta_P = self.alpha * self.G_sign * abs(e * (e / self.Delta_e)) / denom
+                delta_I = self.alpha * self.G_sign * abs(e * self.Sigma_e) / denom
+                delta_D = self.alpha * self.G_sign * abs(e * Delta_e) / denom
+                delta_R = self.alpha * self.G_sign * e / denom
+                # delta_P = self.alpha * self.G_sign * abs(E * e) / denom
+                # delta_I = self.alpha * self.G_sign * abs(E * Delta_e) / denom
+                # delta_D = self.alpha * self.G_sign * abs(E * Delta_e) / denom
+                # delta_R = self.alpha * self.G_sign * E / denom
 
                 # 应用泄漏和投影
                 new_params = (1 - self.sigma_L) * np.array([P, I, D, R]) + np.array(
