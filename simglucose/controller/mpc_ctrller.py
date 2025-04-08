@@ -1,198 +1,188 @@
 from .base import Controller
 from .base import Action
 import numpy as np
-import pandas as pd
-import pkg_resources
-import logging
 from scipy.optimize import minimize
-from scipy.linalg import solve_discrete_are
+import logging
 
 logger = logging.getLogger(__name__)
-CONTROL_QUEST = pkg_resources.resource_filename('simglucose', 'params/Quest.csv')
-PATIENT_PARA_FILE = pkg_resources.resource_filename('simglucose', 'params/vpatient_params.csv')
 
 
 class MPCController(Controller):
-    """
-    MPC Controller for artificial pancreas using UVA/Padova simulator
-    """
+    def __init__(self, patient_params, prediction_horizon=5, control_horizon=3,
+                 target=140, Q=1, R=0.1, max_insulin=5):
+        """
+        MPC Controller for glucose regulation
 
-    def __init__(self, target=140, prediction_horizon=12, control_horizon=6):
-        self.quest = pd.read_csv(CONTROL_QUEST)
-        self.patient_params = pd.read_csv(PATIENT_PARA_FILE)
+        Parameters:
+        - patient_params: Dictionary of patient parameters from the CSV
+        - prediction_horizon: Number of steps to predict ahead
+        - control_horizon: Number of control steps to optimize
+        - target: Target blood glucose level (mg/dL)
+        - Q: Weight for glucose tracking error
+        - R: Weight for control action (insulin)
+        - max_insulin: Maximum allowed insulin dose (U/min)
+        """
+        self.patient_params = patient_params
+        self.prediction_horizon = prediction_horizon
+        self.control_horizon = control_horizon
         self.target = target
-        self.N = prediction_horizon  # 预测时域
-        self.Nu = control_horizon  # 控制时域
-        self.dt = 5  # 分钟(与模拟器步长匹配)
+        self.Q = Q
+        self.R = R
+        self.max_insulin = max_insulin
 
-        # 初始化模型参数(将在第一次调用policy时设置)
-        self.A = None
-        self.B = None
-        self.Q = None
-        self.R = None
-        self.P = None
-        self.u_max = None
-        self.u_min = 0.0
-        self.initialized = False
+        # State history for the observer
+        self.state_history = []
+        self.insulin_history = []
+        self.meal_history = []
 
-    def _initialize_model(self, name):
-        """根据患者名称初始化模型参数"""
-        if any(self.quest.Name.str.match(name)):
-            quest = self.quest[self.quest.Name.str.match(name)]
-            params = self.patient_params[self.patient_params.Name.str.match(name)]
-            u2ss = params.u2ss.values.item()  # unit: pmol/(L*kg)
-            BW = params.BW.values.item()  # unit: kg
-            # 从参数中提取更多需要的参数...
-        else:
-            quest = pd.DataFrame([['Average', 1 / 15, 1 / 50, 50, 30]],
-                                 columns=['Name', 'CR', 'CF', 'TDI', 'Age'])
-            u2ss = 1.43  # unit: pmol/(L*kg)
-            BW = 57.0  # unit: kg
+        # Initialize patient model parameters
+        self._init_patient_model()
 
-        # 设置安全约束
-        self.u_max = 2.0  # U/hr (最大基础率)
+    def _init_patient_model(self):
+        """Extract relevant parameters from patient data for the MPC model"""
+        # These are simplified model parameters based on the CSV columns
+        self.SI = self.patient_params['ki']  # Insulin sensitivity (1/(mU·min))
+        self.ke = self.patient_params['ke1']  # Insulin elimination rate (1/min)
+        self.kabs = self.patient_params['kabs']  # Carbohydrate absorption rate (1/min)
+        self.kg = self.patient_params['ksc']  # Glucose disappearance rate (1/min)
+        self.Vg = self.patient_params['Vg']  # Glucose distribution volume (dL)
 
-        # 创建简化的Bergman最小模型状态空间表示
-        p1 = 0.028735  # 患者参数，可从模拟器参数中获取更精确的值
-        p2 = 0.028344
-        p3 = 5.035e-5
+        # State vector: [Glucose, Insulin, Carbs]
+        self.x = np.zeros(3)
 
-        self.A = np.array([[1 - p1 * self.dt, -p2 * self.dt],
-                           [0, 1 - p3 * self.dt]])
-        self.B = np.array([[0], [self.dt / (BW * 100)]])  # 转换为dL
+    def _patient_model(self, x, u, d, dt):
+        """
+        Simplified glucose-insulin-carbohydrate model for prediction
+        x: state vector [glucose, insulin, carbs]
+        u: insulin input (basal rate)
+        d: meal disturbance (carbs)
+        dt: time step (min)
+        """
+        glucose, insulin, carbs = x
 
-        # 确保矩阵维度正确
-        self.A = np.reshape(self.A, (2, 2))
-        self.B = np.reshape(self.B, (2, 1))
+        # Glucose dynamics
+        dgdt = -self.kg * glucose - self.SI * insulin * glucose + self.kabs * carbs / self.Vg
 
-        # MPC权重矩阵
-        self.Q = np.diag([1.0, 0.01])  # 血糖权重高，胰岛素变化权重低
-        self.R = np.array([[0.1]])  # 控制动作惩罚
+        # Insulin dynamics
+        didt = -self.ke * insulin + u
 
-        # 终端代价(通过Riccati方程计算)
-        self.P = solve_discrete_are(self.A, self.B, self.Q, self.R)
+        # Carbohydrate dynamics
+        dcdt = -self.kabs * carbs + d
 
-        self.initialized = True
-        return BW, quest
+        # Update state
+        new_glucose = glucose + dgdt * dt
+        new_insulin = insulin + didt * dt
+        new_carbs = carbs + dcdt * dt
 
-    def predict_glucose(self, x0, insulin_sequence):
-        """预测血糖轨迹"""
-        x_pred = np.zeros((self.N + 1, 2))
-        x_pred[0] = x0
+        return np.array([new_glucose, new_insulin, new_carbs])
 
-        for k in range(self.N):
-            if k < len(insulin_sequence):
-                u = insulin_sequence[k]
+    def _predict(self, x0, u_sequence, d_sequence, dt):
+        """
+        Predict future states given control sequence
+        """
+        predictions = []
+        x = x0.copy()
+
+        for i in range(self.prediction_horizon):
+            if i < len(u_sequence):
+                u = u_sequence[i]
+                d = d_sequence[i] if i < len(d_sequence) else 0
             else:
-                u = 0.0  # 超出控制时域后假设零输入
+                u = u_sequence[-1]  # Use last control input
+                d = 0  # Assume no meals beyond known horizon
 
-            # 确保矩阵乘法维度正确
-            x_pred[k + 1] = (self.A @ x_pred[k].reshape(-1, 1) + self.B * u).flatten()
+            x = self._patient_model(x, u, d, dt)
+            predictions.append(x[0])  # Only track glucose prediction
 
-        return x_pred
+        return np.array(predictions)
 
-    def cost_function(self, u_flat, x0):
-        """MPC代价函数"""
-        u_seq = u_flat.reshape(-1, 1)
-        x_pred = self.predict_glucose(x0, u_seq)
+    def _cost_function(self, u_sequence, x0, d_sequence, dt):
+        """
+        Cost function for MPC optimization
+        """
+        # Pad control sequence with last value if shorter than prediction horizon
+        if len(u_sequence) < self.prediction_horizon:
+            u_sequence = np.concatenate([
+                u_sequence,
+                np.ones(self.prediction_horizon - len(u_sequence)) * u_sequence[-1]
+            ])
 
-        cost = 0
-        for k in range(self.N):
-            # 血糖误差(相对于目标)
-            glucose_error = x_pred[k][0] - self.target
-            cost += glucose_error ** 2 * self.Q[0, 0] + u_seq[k] ** 2 * self.R[0, 0]
+        # Get predictions
+        predictions = self._predict(x0, u_sequence, d_sequence, dt)
 
-        # 终端代价
-        terminal_error = x_pred[self.N][0] - self.target
-        cost += terminal_error ** 2 * self.P[0, 0]
+        # Calculate tracking error cost
+        error = predictions - self.target
+        tracking_cost = self.Q * np.sum(error ** 2)
 
-        return cost
+        # Calculate control effort cost
+        control_cost = self.R * np.sum(np.array(u_sequence) ** 2)
+
+        return tracking_cost + control_cost
 
     def policy(self, observation, reward, done, **kwargs):
-        sample_time = kwargs.get('sample_time', 1)
-        pname = kwargs.get('patient_name')
-        meal = kwargs.get('meal')  # unit: g/min
-
-        # 第一次调用时初始化模型
-        if not self.initialized:
-            BW, quest = self._initialize_model(pname)
-
-        # 当前状态 (血糖和胰岛素作用)
+        """
+        MPC control policy
+        """
+        # Get current state and parameters
         current_glucose = observation.CGM
-        x0 = np.array([current_glucose, 0.0])  # 假设胰岛素作用初始为0
+        sample_time = kwargs.get('sample_time', 5)  # Default to 5 min if not provided
+        meal = kwargs.get('meal', 0)  # Current meal disturbance
 
-        # 优化问题设置
-        def constraint_func(u_flat):
-            u_seq = u_flat.reshape(-1, 1)
-            x_pred = self.predict_glucose(x0, u_seq)
-            # 可以添加状态约束(如血糖不能低于某个值)
-            return x_pred[:, 0]  # 返回所有预测的血糖值
+        # Update state history
+        self.state_history.append(current_glucose)
+        self.meal_history.append(meal)
 
-        # 初始猜测(患者基础率)
-        if any(self.quest.Name.str.match(pname)):
-            params = self.patient_params[self.patient_params.Name.str.match(pname)]
-            u2ss = params.u2ss.values.item()
-            BW = params.BW.values.item()
-            u0 = np.ones(self.Nu) * u2ss * BW / 6000  # U/min
+        # Estimate current insulin (simplified - in practice would need better observer)
+        if len(self.insulin_history) > 0:
+            current_insulin = self.insulin_history[-1]
         else:
-            u0 = np.ones(self.Nu) * 0.01  # 默认基础率
+            current_insulin = 0
 
-        # 约束条件
-        bounds = [(self.u_min, self.u_max)] * self.Nu
-        constraints = {
-            'type': 'ineq',
-            'fun': lambda u: constraint_func(u) - 70  # 血糖>70 mg/dL
-        }
+        # Current state vector [glucose, insulin, carbs]
+        x0 = np.array([current_glucose, current_insulin, 0])  # Carbs starts at 0
 
-        # 如果有餐食，添加推注
-        if meal > 0:
-            logger.info('Calculating bolus for meal...')
-            if any(self.quest.Name.str.match(pname)):
-                quest = self.quest[self.quest.Name.str.match(pname)]
-                bolus = ((meal * sample_time) / quest.CR.values +
-                         (current_glucose - self.target) / quest.CF.values).item()
-            else:
-                bolus = (meal * sample_time) / 15  # 默认碳水化合物比例
+        # Known meal disturbances (simplified - assumes we know upcoming meals)
+        d_sequence = self.meal_history[-self.control_horizon:] + [0] * (self.control_horizon - len(self.meal_history))
 
-            # 将推注添加到初始控制序列
-            u0[0] += bolus / sample_time  # 转换为U/min
+        # Initial guess for control sequence (previous insulin or basal rate)
+        if len(self.insulin_history) > 0:
+            u_init = np.ones(self.control_horizon) * self.insulin_history[-1]
+        else:
+            u_init = np.ones(self.control_horizon) * self.patient_params['Ib'] / 1440  # Convert daily basal to per-min
 
-            # 限制推注不超过最大值
-            u0 = np.clip(u0, self.u_min, self.u_max)
+        # Constraints - insulin must be positive and below max
+        bounds = [(0, self.max_insulin)] * self.control_horizon
 
-        # 优化
-        res = minimize(self.cost_function, u0, args=(x0,),
-                       bounds=bounds, constraints=constraints,
-                       method='SLSQP')
+        # Optimize control sequence
+        res = minimize(
+            self._cost_function,
+            u_init,
+            args=(x0, d_sequence, sample_time),
+            bounds=bounds,
+            method='SLSQP'
+        )
 
         if not res.success:
             logger.warning(f"MPC optimization failed: {res.message}")
-            # 失败时返回基础率
-            basal = u0[0] if meal == 0 else u0[0] - bolus / sample_time
-            return Action(basal=basal, bolus=0)
+            optimal_u = u_init  # Fall back to initial guess
+        else:
+            optimal_u = res.x
 
-        # 提取最优控制序列
-        u_opt = res.x.reshape((self.Nu, 1))
+        # Apply first control input
+        control_input = optimal_u[0]
 
-        # 仅应用第一个控制输入 (根据MPC原理)
-        basal = u_opt[0, 0]
+        # Update insulin history
+        self.insulin_history.append(control_input)
 
-        # 如果有餐食，将推注部分分离出来
-        bolus = 0
-        if meal > 0:
-            if any(self.quest.Name.str.match(pname)):
-                params = self.patient_params[self.patient_params.Name.str.match(pname)]
-                u2ss = params.u2ss.values.item()
-                BW = params.BW.values.item()
-                basal_normal = u2ss * BW / 6000
-            else:
-                basal_normal = 0.01
+        logger.info(f"MPC control: glucose={current_glucose}, insulin={control_input:.2f}")
 
-            bolus = max(0, basal - basal_normal) * sample_time
-            basal = basal_normal
-
-        return Action(basal=basal, bolus=bolus)
+        # Return action (convert to basal rate, bolus=0 for MPC)
+        action = Action(basal=control_input, bolus=0)
+        return action
 
     def reset(self):
-        """重置控制器状态"""
-        self.initialized = False
+        """Reset controller state"""
+        self.state_history = []
+        self.insulin_history = []
+        self.meal_history = []
+        self._init_patient_model()
