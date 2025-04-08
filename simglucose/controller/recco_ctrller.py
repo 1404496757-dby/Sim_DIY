@@ -3,6 +3,9 @@ import pandas as pd
 import csv
 import time
 from .base import Controller, Action
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class RECCoController(Controller):
@@ -15,7 +18,6 @@ class RECCoController(Controller):
                  Ts=1,
                  target=140,
                  cloud_file='recco_clouds.csv'):
-
         self.target = target
         self.y_min = y_min
         self.y_max = y_max
@@ -47,7 +49,7 @@ class RECCoController(Controller):
         self.k = 0  # 时间步
 
     def load_clouds(self):
-        """从CSV加载云数据"""
+        """从指定路径的 CSV 加载云数据"""
         try:
             with open(self.cloud_file, 'r') as f:
                 reader = csv.DictReader(f)
@@ -70,7 +72,7 @@ class RECCoController(Controller):
             pass  # 初始化时文件不存在，创建空云列表
 
     def save_clouds(self):
-        """将云数据保存到CSV"""
+        """将云数据保存到指定路径的 CSV"""
         fieldnames = ['mu1', 'mu2', 'sigma', 'M', 'k_add', 'P', 'I', 'D', 'R']
         with open(self.cloud_file, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -109,7 +111,8 @@ class RECCoController(Controller):
             }
             self.clouds.append(new_cloud)
             self.c = 1
-            return 0  # 新云索引
+            gamma = np.array([1])
+            return 0, gamma  # 新云索引和 gamma
 
         # 计算所有云的局部密度
         gamma = []
@@ -126,7 +129,7 @@ class RECCoController(Controller):
 
         # 检查是否添加新云
         add_condition = (max_gamma < 0.93) and (self.k > (self.clouds[max_idx]['k_add'] + 20))
-        if add_condition and self.c < 20:  # 文献中cmax=20
+        if add_condition and self.c < 20:  # 文献中 cmax=20
             # 初始化新云参数为现有云的加权平均
             theta_init = np.sum([l * cloud['theta'] for l, cloud in zip(lambda_i, self.clouds)], axis=0)
             new_cloud = {
@@ -138,17 +141,17 @@ class RECCoController(Controller):
             }
             self.clouds.append(new_cloud)
             self.c += 1
-            return self.c - 1  # 新云索引
+            return self.c - 1, gamma  # 新云索引和 gamma
         else:
             # 更新关联云
             cloud = self.clouds[max_idx]
             cloud['mu'] = ((cloud['M'] - 1) * cloud['mu'] + x) / cloud['M']
             cloud['sigma'] = ((cloud['M'] - 1) * cloud['sigma'] + np.linalg.norm(x) ** 2) / cloud['M']
             cloud['M'] += 1
-            return max_idx  # 关联云索引
+            return max_idx, gamma  # 关联云索引和 gamma
 
     def _adapt_parameters(self, active_idx, epsilon, delta_epsilon, integral_epsilon, r):
-        """适应法则：更新PID-R参数"""
+        """适应法则：更新 PID - R 参数"""
         cloud = self.clouds[active_idx]
         theta_prev = cloud['theta']
 
@@ -197,11 +200,11 @@ class RECCoController(Controller):
         return u
 
     def policy(self, observation, reward, done, **kwargs):
-        """主控制策略，兼容basal_bolus_ctrller接口"""
+        """主控制策略，兼容 basal_bolus_ctrller 接口"""
         cgm = observation.CGM
         sample_time = kwargs.get('sample_time', 1)
         patient_name = kwargs.get('patient_name', 'adult#001')
-        meal = kwargs.get('meal', 0)  # 暂时忽略meal，专注血糖控制
+        meal = kwargs.get('meal', 0)  # 暂时忽略 meal，专注血糖控制
 
         # 1. 参考模型计算
         r = self.target  # 目标血糖
@@ -213,7 +216,7 @@ class RECCoController(Controller):
         x = self._normalize_data(epsilon, self.y_r_current)
 
         # 3. 演化云
-        active_idx = self._evolve_clouds(x)
+        active_idx, gamma = self._evolve_clouds(x)
         self.clouds[active_idx]['lambda'] = gamma[active_idx] / gamma.sum()  # 关联度
 
         # 4. 适应参数
@@ -231,7 +234,7 @@ class RECCoController(Controller):
         if self.k % 10 == 0:  # 定期保存
             self.save_clouds()
 
-        return Action(basal=u, bolus=0)  # 简化为总胰岛素剂量，基线+ bolus可扩展
+        return Action(basal=u, bolus=0)  # 简化为总胰岛素剂量，基线 + bolus 可扩展
 
     def reset(self):
         """重置控制器状态"""
