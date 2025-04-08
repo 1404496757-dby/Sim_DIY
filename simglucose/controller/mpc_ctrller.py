@@ -1,23 +1,20 @@
 from .base import Controller
 from .base import Action
 import numpy as np
-import pandas as pd
 from scipy.optimize import minimize
-import pkg_resources
 import logging
 
 logger = logging.getLogger(__name__)
-PATIENT_PARA_FILE = pkg_resources.resource_filename(
-    'simglucose', 'params/vpatient_params.csv')
+
 
 class MPCController(Controller):
-    def __init__(self, prediction_horizon=5, control_horizon=3,
+    def __init__(self, patient_params, prediction_horizon=5, control_horizon=3,
                  target=140, Q=1, R=0.1, max_insulin=5):
         """
         MPC Controller for glucose regulation
 
         Parameters:
-        - patient_params: Dictionary of patient parameters from the CSV
+        - patient_params: Dictionary or pandas Series of patient parameters
         - prediction_horizon: Number of steps to predict ahead
         - control_horizon: Number of control steps to optimize
         - target: Target blood glucose level (mg/dL)
@@ -25,7 +22,12 @@ class MPCController(Controller):
         - R: Weight for control action (insulin)
         - max_insulin: Maximum allowed insulin dose (U/min)
         """
-        self.patient_params = pd.read_csv(PATIENT_PARA_FILE)
+        # Convert patient_params to dictionary if it's a pandas Series
+        if hasattr(patient_params, 'to_dict'):
+            self.patient_params = patient_params.to_dict()
+        else:
+            self.patient_params = patient_params
+
         self.prediction_horizon = prediction_horizon
         self.control_horizon = control_horizon
         self.target = target
@@ -43,12 +45,15 @@ class MPCController(Controller):
 
     def _init_patient_model(self):
         """Extract relevant parameters from patient data for the MPC model"""
-        # These are simplified model parameters based on the CSV columns
-        self.SI = self.patient_params['ki']  # Insulin sensitivity (1/(mU·min))
-        self.ke = self.patient_params['ke1']  # Insulin elimination rate (1/min)
-        self.kabs = self.patient_params['kabs']  # Carbohydrate absorption rate (1/min)
-        self.kg = self.patient_params['ksc']  # Glucose disappearance rate (1/min)
-        self.Vg = self.patient_params['Vg']  # Glucose distribution volume (dL)
+        # Convert parameters to floats to avoid pandas Series issues
+        self.SI = float(self.patient_params['ki'])  # Insulin sensitivity (1/(mU·min))
+        self.ke = float(self.patient_params['ke1'])  # Insulin elimination rate (1/min)
+        self.kabs = float(self.patient_params['kabs'])  # Carbohydrate absorption rate (1/min)
+        self.kg = float(self.patient_params['ksc'])  # Glucose disappearance rate (1/min)
+        self.Vg = float(self.patient_params['Vg'])  # Glucose distribution volume (dL)
+
+        # Get basal rate as float
+        self.basal_rate = float(self.patient_params['Ib']) / 1440  # Convert daily basal to per-min
 
         # State vector: [Glucose, Insulin, Carbs]
         self.x = np.zeros(3)
@@ -151,7 +156,7 @@ class MPCController(Controller):
         if len(self.insulin_history) > 0:
             u_init = np.ones(self.control_horizon) * self.insulin_history[-1]
         else:
-            u_init = np.ones(self.control_horizon) * self.patient_params['Ib'] / 1440  # Convert daily basal to per-min
+            u_init = np.ones(self.control_horizon) * self.basal_rate
 
         # Constraints - insulin must be positive and below max
         bounds = [(0, self.max_insulin)] * self.control_horizon
