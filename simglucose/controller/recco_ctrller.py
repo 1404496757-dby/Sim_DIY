@@ -141,13 +141,8 @@ class RECCoController(Controller):
             }
             self.clouds.append(new_cloud)
             self.c += 1
-            # 重新计算 gamma 以包含新云
-            gamma = []
-            for cloud in self.clouds:
-                norm_sq = np.linalg.norm(x - cloud['mu']) ** 2
-                gamma_i = 1 / (1 + norm_sq + cloud['sigma'] - np.linalg.norm(cloud['mu']) ** 2)
-                gamma.append(gamma_i)
-            gamma = np.array(gamma)
+            # 更新 gamma 数组以包含新云
+            gamma = np.append(gamma, [0])
             return self.c - 1, gamma  # 新云索引和 gamma
         else:
             # 更新关联云
@@ -209,9 +204,9 @@ class RECCoController(Controller):
     def policy(self, observation, reward, done, **kwargs):
         """主控制策略，兼容 basal_bolus_ctrller 接口"""
         cgm = observation.CGM
-        sample_time = kwargs.get('sample_time', 1)
-        patient_name = kwargs.get('patient_name', 'adult#001')
-        meal = kwargs.get('meal', 0)  # 暂时忽略 meal，专注血糖控制
+        # sample_time = kwargs.get('sample_time', 1)
+        # patient_name = kwargs.get('patient_name', 'adult#001')
+        # meal = kwargs.get('meal', 0)  # 暂时忽略 meal，专注血糖控制
 
         # 1. 参考模型计算
         r = self.target  # 目标血糖
@@ -224,13 +219,26 @@ class RECCoController(Controller):
 
         # 3. 演化云
         active_idx, gamma = self._evolve_clouds(x)
-        self.clouds[active_idx]['lambda'] = gamma[active_idx] / gamma.sum()  # 关联度
+        # 确保 gamma 数组大小与云的数量一致
+        if len(gamma) != len(self.clouds):
+            # 如果大小不匹配，重新创建 gamma 数组
+            gamma = np.zeros(len(self.clouds))
+            gamma[active_idx] = 1.0
+
+        # 计算关联度
+        gamma_sum = gamma.sum()
+        if gamma_sum > 0:
+            self.clouds[active_idx]['lambda'] = gamma[active_idx] / gamma_sum
+        else:
+            self.clouds[active_idx]['lambda'] = 1.0  # 避免除零错误
 
         # 4. 适应参数
         self._adapt_parameters(active_idx, epsilon, delta_epsilon, self.integral, r)
 
         # 5. 计算控制信号
         u = self._compute_control(active_idx, epsilon, self.integral, delta_epsilon)
+        if cgm < 140:
+            u = 0
 
         # 6. 保存状态
         self.y_r_prev = self.y_r_current
@@ -252,4 +260,3 @@ class RECCoController(Controller):
         self.integral = 0
         self.k = 0
         self.prev_u = 0
-    
