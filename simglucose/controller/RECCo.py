@@ -368,14 +368,14 @@ class RECCoGlucoseController(Controller):
             # 自适应律 (仅当误差较大时)
             if abs(e) > self.d_dead:
                 denom = 1 + self.target ** 2
-                delta_P = self.alpha * self.G_sign * abs(e * (e / self.Delta_e)) / denom
-                delta_I = self.alpha * self.G_sign * abs(e * self.Sigma_e) / denom
-                delta_D = self.alpha * self.G_sign * abs(e * Delta_e) / denom
-                delta_R = self.alpha * self.G_sign * e / denom
-                # delta_P = self.alpha * self.G_sign * abs(E * e) / denom
-                # delta_I = self.alpha * self.G_sign * abs(E * Delta_e) / denom
-                # delta_D = self.alpha * self.G_sign * abs(E * Delta_e) / denom
-                # delta_R = self.alpha * self.G_sign * E / denom
+                # delta_P = self.alpha * self.G_sign * abs(e * (e / self.Delta_e)) / denom
+                # delta_I = self.alpha * self.G_sign * abs(e * self.Sigma_e) / denom
+                # delta_D = self.alpha * self.G_sign * abs(e * Delta_e) / denom
+                # delta_R = self.alpha * self.G_sign * e / denom
+                delta_P = self.alpha * self.G_sign * abs(E * e) / denom
+                delta_I = self.alpha * self.G_sign * abs(E * Delta_e) / denom
+                delta_D = self.alpha * self.G_sign * abs(E * Delta_e) / denom
+                delta_R = self.alpha * self.G_sign * E / denom
 
                 # 应用泄漏和投影
                 new_params = (1 - self.sigma_L) * np.array([P, I, D, R]) + np.array(
@@ -389,10 +389,10 @@ class RECCoGlucoseController(Controller):
             # 6. 计算控制量 (分开计算basal和bolus)
             basal_raw = P * e + I * self.Sigma_e + D * Delta_e + R
             # 低血糖安全保护
-            if CGM < 140:  # 低血糖保护
+            if CGM < 80:  # 低血糖保护
                 basal_raw = 0
-            # elif CGM < 100 and e < 0:  # 接近低血糖且血糖仍在下降
-            #     basal_raw = basal_raw * 0.5  # 减少胰岛素剂量
+            elif CGM < 100 and e < 0:  # 接近低血糖且血糖仍在下降
+                basal_raw = basal_raw * 0.5  # 减少胰岛素剂量
             # 限制在允许范围内
             basal = max(self.u_range[0], min(basal_raw, self.u_range[1]))
             # 大餐时的额外胰岛素 (bolus)
