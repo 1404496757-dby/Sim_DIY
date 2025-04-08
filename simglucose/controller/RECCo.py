@@ -6,10 +6,10 @@ import pkg_resources
 import logging
 
 logger = logging.getLogger(__name__)
-CONTROL_QUEST = pkg_resources.resource_filename('simglucose',
-                                                'params/Quest.csv')
-PATIENT_PARA_FILE = pkg_resources.resource_filename(
-    'simglucose', 'params/vpatient_params.csv')
+# CONTROL_QUEST = pkg_resources.resource_filename('simglucose',
+#                                                 'params/Quest.csv')
+# PATIENT_PARA_FILE = pkg_resources.resource_filename(
+#     'simglucose', 'params/vpatient_params.csv')
 
 
 class CloudManager:
@@ -408,7 +408,7 @@ class RECCoGlucoseController(Controller):
             basal = max(self.u_range[0], min(basal_raw, self.u_range[1]))
             # 大餐时的额外胰岛素 (bolus)
             bolus = 0  # 默认不使用bolus
-            bolus = self._bb_policy(pname, meal, observation.CGM, sample_time)
+            # bolus = self._bb_policy(pname, meal, observation.CGM, sample_time)
             # 如果info中包含meal信息，可以考虑添加餐前胰岛素
             # if 'meal' in info and info['meal'] > 10:  # 大于10g的碳水被视为餐食
             #     # 简单的餐前胰岛素计算 (碳水/胰岛素比例约为10:1)
