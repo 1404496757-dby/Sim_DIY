@@ -2,6 +2,7 @@ from .base import Controller
 from .base import Action
 import numpy as np
 from scipy.optimize import minimize
+import pkg_resources
 import logging
 
 logger = logging.getLogger(__name__)
