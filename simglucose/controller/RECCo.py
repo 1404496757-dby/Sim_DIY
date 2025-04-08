@@ -319,9 +319,9 @@ class RECCoGlucoseController(Controller):
         输出: Action(basal, bolus)
         """
         CGM = observation.CGM
-        sample_time = kwargs.get('sample_time', 1)
-        pname = kwargs.get('patient_name')
-        meal = kwargs.get('meal')  # unit: g/min
+        sample_time = info.get('sample_time', 1)
+        pname = info.get('patient_name')
+        meal = info.get('meal')  # unit: g/min
         self.cloud_manager.increment_time()
 
         # 1. 参考模型
