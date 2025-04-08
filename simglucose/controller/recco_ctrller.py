@@ -1,185 +1,244 @@
 import numpy as np
+import pandas as pd
+import csv
+import time
 from .base import Controller, Action
 
 
-class RECCoGlucoseController(Controller):
-    def __init__(self, target=120,safe_min=70,safe_max=180,Ts=3,tau=60,y_range=(60,150)):
-        """
-        针对血糖控制的RECCo控制器
+class RECCoController(Controller):
+    def __init__(self,
+                 y_min=0,
+                 y_max=200,
+                 u_min=0,
+                 u_max=10,
+                 tau=40,
+                 Ts=1,
+                 target=140,
+                 cloud_file='recco_clouds.csv'):
 
-        参数：
-        patient_name: 患者ID，用于获取默认参数
-        """
-        # super().__init__()
+        self.target = target
+        self.y_min = y_min
+        self.y_max = y_max
+        self.u_min = u_min
+        self.u_max = u_max
+        self.tau = tau
+        self.Ts = Ts
+        self.cloud_file = cloud_file
+        self.ar = 1 - Ts / tau  # 参考模型极点
 
-        # 血糖控制特定参数
-        self.target = target  # 目标血糖值 (mg/dL)
-        self.safe_min = safe_min  # 低血糖阈值
-        self.safe_max = safe_max  # 高血糖阈值
+        # 初始化云数据
+        self.clouds = []  # 每个云包含: mu, sigma, M, k_add, P, I, D, R
+        self.load_clouds()
 
-        # 控制输入范围 (U/h)
-        self.u_range = (0, 5)  # 基础率范围
-        self.bolus_range = (0, 10)  # 推注剂量范围
+        # 适应参数
+        self.alpha = 0.1  # 基础适应增益
+        self.alpha_adjust = (u_max - u_min) / 20 * self.alpha
+        self.g_sign = 1  # 假设过程增益为正
+        self.d_dead = 0.1  # 死区阈值
+        self.sigma_L = 1e-6  # 泄漏因子
+        self.theta_low = np.array([0, 0, 0, -np.inf])  # 参数下限 (P,I,D,R)
+        self.theta_high = np.array([np.inf, np.inf, np.inf, np.inf])  # 参数上限
 
-        # 时间参数 (分钟)
-        self.Ts = Ts  # simglucose默认采样时间
-        self.tau = tau  # 估计的血糖响应时间常数
+        # 控制状态
+        self.y_r_prev = target
+        self.epsilon_prev = 0
+        self.integral = 0
+        self.c = len(self.clouds)
+        self.k = 0  # 时间步
 
-        # 输出范围 (mg/dL)
-        self.y_range = y_range  # 合理的血糖范围
+    def load_clouds(self):
+        """从CSV加载云数据"""
+        try:
+            with open(self.cloud_file, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    cloud = {
+                        'mu': np.array([float(row['mu1']), float(row['mu2'])]),
+                        'sigma': float(row['sigma']),
+                        'M': int(row['M']),
+                        'k_add': int(row['k_add']),
+                        'theta': np.array([
+                            float(row['P']),
+                            float(row['I']),
+                            float(row['D']),
+                            float(row['R'])
+                        ])
+                    }
+                    self.clouds.append(cloud)
+            self.c = len(self.clouds)
+        except FileNotFoundError:
+            pass  # 初始化时文件不存在，创建空云列表
 
-        # 初始化RECCo核心参数
-        self._init_recco_params()
+    def save_clouds(self):
+        """将云数据保存到CSV"""
+        fieldnames = ['mu1', 'mu2', 'sigma', 'M', 'k_add', 'P', 'I', 'D', 'R']
+        with open(self.cloud_file, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for cloud in self.clouds:
+                writer.writerow({
+                    'mu1': cloud['mu'][0],
+                    'mu2': cloud['mu'][1],
+                    'sigma': cloud['sigma'],
+                    'M': cloud['M'],
+                    'k_add': cloud['k_add'],
+                    'P': cloud['theta'][0],
+                    'I': cloud['theta'][1],
+                    'D': cloud['theta'][2],
+                    'R': cloud['theta'][3]
+                })
 
-        # 状态变量
-        self.last_CGM = None
-        self.last_action = Action(basal=0, bolus=0)
+    def _normalize_data(self, epsilon, y_r):
+        """归一化数据点"""
+        delta_y = self.y_max - self.y_min
+        delta_epsilon = delta_y / 2
+        x1 = epsilon / delta_epsilon
+        x2 = (y_r - self.y_min) / delta_y
+        return np.array([x1, x2])
 
-    def _init_recco_params(self):
-        """初始化RECCo核心参数"""
-        # 参考模型参数
-        self.a_r = 1 - self.Ts / 60 / self.tau  # 转换为小时
+    def _evolve_clouds(self, x):
+        """演化法则：添加新云或更新现有云"""
+        if self.c == 0:
+            # 初始化第一个云
+            new_cloud = {
+                'mu': x.copy(),
+                'sigma': np.linalg.norm(x) ** 2,
+                'M': 1,
+                'k_add': self.k,
+                'theta': np.zeros(4)  # 初始参数全零
+            }
+            self.clouds.append(new_cloud)
+            self.c = 1
+            return 0  # 新云索引
 
-        # 自适应参数
-        self.alpha = 0.1 * (self.u_range[1] - self.u_range[0]) / 20
-        self.G_sign = -1  # 胰岛素对血糖是负影响
-        self.n_add = 12  # 5分钟采样，20个样本约1.5小时
+        # 计算所有云的局部密度
+        gamma = []
+        for cloud in self.clouds:
+            norm_sq = np.linalg.norm(x - cloud['mu']) ** 2
+            gamma_i = 1 / (1 + norm_sq + cloud['sigma'] - np.linalg.norm(cloud['mu']) ** 2)
+            gamma.append(gamma_i)
+        gamma = np.array(gamma)
+        lambda_total = gamma.sum()
+        lambda_i = gamma / lambda_total if lambda_total != 0 else np.zeros(self.c)
 
-        # 数据云存储
-        self.clouds = []
-        self.last_add_time = -np.inf
-        self.time = 0
+        max_gamma = gamma.max()
+        max_idx = np.argmax(gamma)
 
-        # 误差积分
-        self.Sigma_e = 0
-        self.last_e = 0
-
-        # 鲁棒性参数
-        self.Delta_y = self.y_range[1] - self.y_range[0]
-        self.Delta_e = self.Delta_y / 2
-        self.d_dead = 5  # mg/dL死区阈值
-        self.sigma_L = 1e-6
-
-    def _normalize(self, e, y_ref):
-        """数据标准化"""
-        return np.array([
-            e / self.Delta_e,
-            (y_ref - self.y_range[0]) / self.Delta_y
-        ])
-
-    def _local_density(self, x, cloud):
-        """计算局部密度"""
-        diff = x - cloud['mean']
-        return 1 / (1 + np.dot(diff, diff) + cloud['sigma'] - np.dot(cloud['mean'], cloud['mean']))
-
-    def _add_cloud(self, x):
-        """添加新数据云"""
-        new_cloud = {
-            'mean': x.copy(),
-            'sigma': np.dot(x, x),
-            'count': 1,
-            'params': self._initialize_params(),
-            'added_time': self.time
-        }
-        self.clouds.append(new_cloud)
-        return new_cloud
-
-    def _initialize_params(self):
-        """初始化PID-R参数"""
-        if not self.clouds:
-            # 初始参数基于临床经验
-            return np.array([0.01, 0.001, 0.0, 0.0])  # P, I, D, R
-
-        # 加权平均现有参数
-        weights = [c['count'] for c in self.clouds]
-        total = sum(weights)
-        return sum([c['params'] * w for c, w in zip(self.clouds, weights)]) / total
-
-    def policy(self, observation, reward, done, **info):
-        """
-        simglucose控制器接口
-        输入: observation.CGM (当前血糖值)
-        输出: Action(basal, bolus)
-        """
-        CGM = observation.CGM
-        self.time += 1
-
-        # 1. 参考模型
-        if not hasattr(self, 'y_ref_prev'):
-            self.y_ref_prev = self.target
-        y_ref = self.a_r * self.y_ref_prev + (1 - self.a_r) * self.target
-        self.y_ref_prev = y_ref
-
-        # 2. 计算误差
-        e = y_ref - CGM
-
-        # 3. 数据预处理
-        x = self._normalize(e, y_ref)
-
-        # 4. 演化机制
-        densities = []
-        if self.clouds:
-            densities = [self._local_density(x, c) for c in self.clouds]
-            max_density = max(densities) if densities else 0
-            active_idx = np.argmax(densities) if densities else -1
+        # 检查是否添加新云
+        add_condition = (max_gamma < 0.93) and (self.k > (self.clouds[max_idx]['k_add'] + 20))
+        if add_condition and self.c < 20:  # 文献中cmax=20
+            # 初始化新云参数为现有云的加权平均
+            theta_init = np.sum([l * cloud['theta'] for l, cloud in zip(lambda_i, self.clouds)], axis=0)
+            new_cloud = {
+                'mu': x.copy(),
+                'sigma': np.linalg.norm(x) ** 2,
+                'M': 1,
+                'k_add': self.k,
+                'theta': theta_init
+            }
+            self.clouds.append(new_cloud)
+            self.c += 1
+            return self.c - 1  # 新云索引
         else:
-            max_density = 0
-            active_idx = -1
+            # 更新关联云
+            cloud = self.clouds[max_idx]
+            cloud['mu'] = ((cloud['M'] - 1) * cloud['mu'] + x) / cloud['M']
+            cloud['sigma'] = ((cloud['M'] - 1) * cloud['sigma'] + np.linalg.norm(x) ** 2) / cloud['M']
+            cloud['M'] += 1
+            return max_idx  # 关联云索引
 
-        # 判断是否需要添加新云
-        if (max_density < 0.93 and
-                (self.time - self.last_add_time) > self.n_add):
-            self._add_cloud(x)
-            self.last_add_time = self.time
-            densities = [self._local_density(x, c) for c in self.clouds]
-            active_idx = len(self.clouds) - 1
+    def _adapt_parameters(self, active_idx, epsilon, delta_epsilon, integral_epsilon, r):
+        """适应法则：更新PID-R参数"""
+        cloud = self.clouds[active_idx]
+        theta_prev = cloud['theta']
 
-        # 5. 参数自适应
-        basal = bolus = 0
-        if self.clouds:
-            active_cloud = self.clouds[active_idx]
-            P, I, D, R = active_cloud['params']
+        # 计算适应增量
+        norm_r = 1 + r ** 2
+        delta_P = self.alpha_adjust * self.g_sign * cloud['lambda'] * (np.abs(epsilon) * np.abs(epsilon)) / norm_r
+        delta_I = self.alpha_adjust * self.g_sign * cloud['lambda'] * (np.abs(epsilon) * np.abs(delta_epsilon)) / norm_r
+        delta_D = self.alpha_adjust * self.g_sign * cloud['lambda'] * (np.abs(epsilon) * np.abs(delta_epsilon)) / norm_r
+        delta_R = self.alpha_adjust * self.g_sign * cloud['lambda'] * epsilon / norm_r
+        delta_theta = np.array([delta_P, delta_I, delta_D, delta_R])
 
-            # 计算积分和微分项
-            Delta_e = e - self.last_e
-            if self.last_action.basal < self.u_range[1] and self.last_action.basal > self.u_range[0]:
-                self.Sigma_e += e
+        # 死区机制
+        if np.abs(epsilon) < self.d_dead:
+            delta_theta = np.zeros(4)
 
-            # 自适应律 (仅当误差较大时)
-            if abs(e) > self.d_dead:
-                denom = 1 + self.target ** 2
-                delta_P = self.alpha * self.G_sign * abs(e * (e / self.Delta_e)) / denom
-                delta_I = self.alpha * self.G_sign * abs(e * self.Sigma_e) / denom
-                delta_D = self.alpha * self.G_sign * abs(e * Delta_e) / denom
-                delta_R = self.alpha * self.G_sign * e / denom
+        # 泄漏机制
+        theta_candidate = (1 - self.sigma_L) * theta_prev + delta_theta
 
-                # 应用泄漏和投影
-                new_params = (1 - self.sigma_L) * np.array([P, I, D, R]) + np.array(
-                    [delta_P, delta_I, delta_D, delta_R])
-                new_params[:3] = np.maximum(new_params[:3], 0)  # P,I,D >=0
-                active_cloud['params'] = new_params
+        # 参数投影
+        theta_clamped = np.clip(theta_candidate, self.theta_low, self.theta_high)
 
-            # 6. 计算控制量 (分开计算basal和bolus)
-            # basal基于长期误差 (P和I项)
-            basal = np.clip(P * e + I * self.Sigma_e + R, *self.u_range)
+        # 更新参数
+        cloud['theta'] = theta_clamped
 
-            # bolus基于短期变化 (D项和紧急校正)
-            bolus = np.clip(D * Delta_e + (0.1 if e > 20 else 0), *self.bolus_range)
+    def _compute_control(self, active_idx, epsilon, integral_epsilon, delta_epsilon):
+        """计算控制信号"""
+        cloud = self.clouds[active_idx]
+        P, I, D, R = cloud['theta']
 
-            # 低血糖保护
-            if CGM < 80:
-                basal = 0
-                bolus = 0
+        # 反饱和积分
+        u_prev = self.prev_u if hasattr(self, 'prev_u') else 0
+        if self.u_min < u_prev < self.u_max:
+            self.integral += epsilon * self.Ts
+        else:
+            self.integral = self.integral  # 保持上次积分值
 
-        # 更新状态
-        self.last_e = e
-        self.last_CGM = CGM
-        self.last_action = Action(basal=basal, bolus=bolus)
+        u_local = P * epsilon + I * self.integral + D * delta_epsilon + R
 
-        return self.last_action
+        # 加权平均多个云的输出（当前简化为单云或激活云）
+        # 文献中使用加权平均，但为简化当前场景假设单激活云
+        u = u_local
+
+        # 限制输出范围
+        u = np.clip(u, self.u_min, self.u_max)
+        self.prev_u = u  # 保存上一时刻控制量
+        return u
+
+    def policy(self, observation, reward, done, **kwargs):
+        """主控制策略，兼容basal_bolus_ctrller接口"""
+        cgm = observation.CGM
+        sample_time = kwargs.get('sample_time', 1)
+        patient_name = kwargs.get('patient_name', 'adult#001')
+        meal = kwargs.get('meal', 0)  # 暂时忽略meal，专注血糖控制
+
+        # 1. 参考模型计算
+        r = self.target  # 目标血糖
+        self.y_r_current = self.ar * self.y_r_prev + (1 - self.ar) * r
+        epsilon = self.y_r_current - cgm
+        delta_epsilon = epsilon - self.epsilon_prev
+
+        # 2. 归一化数据点
+        x = self._normalize_data(epsilon, self.y_r_current)
+
+        # 3. 演化云
+        active_idx = self._evolve_clouds(x)
+        self.clouds[active_idx]['lambda'] = gamma[active_idx] / gamma.sum()  # 关联度
+
+        # 4. 适应参数
+        self._adapt_parameters(active_idx, epsilon, delta_epsilon, self.integral, r)
+
+        # 5. 计算控制信号
+        u = self._compute_control(active_idx, epsilon, self.integral, delta_epsilon)
+
+        # 6. 保存状态
+        self.y_r_prev = self.y_r_current
+        self.epsilon_prev = epsilon
+        self.k += 1
+
+        # 7. 保存云数据
+        if self.k % 10 == 0:  # 定期保存
+            self.save_clouds()
+
+        return Action(basal=u, bolus=0)  # 简化为总胰岛素剂量，基线+ bolus可扩展
 
     def reset(self):
         """重置控制器状态"""
-        self._init_recco_params()
-        self.last_CGM = None
-        self.last_action = Action(basal=0, bolus=0)
+        self.clouds = []
+        self.load_clouds()
+        self.y_r_prev = self.target
+        self.epsilon_prev = 0
+        self.integral = 0
+        self.k = 0
+        self.prev_u = 0
