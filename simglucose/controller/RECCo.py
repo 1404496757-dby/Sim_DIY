@@ -324,10 +324,10 @@ class RECCoGlucoseController(Controller):
 
         # 2. 计算误差
         e = y_ref - CGM
-        E = self.target - CGM
+        # E = self.target - CGM
 
         # 3. 数据预处理
-        x = self._normalize(E, y_ref)
+        x = self._normalize(e, y_ref)
 
         # 4. 演化机制
         densities = []
