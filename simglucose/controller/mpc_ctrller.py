@@ -4,8 +4,7 @@ import numpy as np
 import pandas as pd
 import pkg_resources
 import logging
-import cvxpy as cp
-from scipy.interpolate import interp1d
+import scipy.optimize as optimize
 
 logger = logging.getLogger(__name__)
 CONTROL_QUEST = pkg_resources.resource_filename('simglucose',
@@ -131,6 +130,41 @@ class MPCController(Controller):
 
         return glucose_pred
 
+    def _objective_function(self, insulin_plan, initial_glucose, meal_prediction, steps, target):
+        """
+        MPC优化的目标函数
+
+        参数:
+        - insulin_plan: 胰岛素输注计划
+        - initial_glucose: 初始血糖水平
+        - meal_prediction: 预测的餐食摄入
+        - steps: 预测步数
+        - target: 目标血糖水平
+
+        返回:
+        - 目标函数值 (越小越好)
+        """
+        # 预测血糖水平
+        glucose_pred = self._predict_glucose(initial_glucose, insulin_plan, meal_prediction, steps)
+
+        # 计算与目标的偏差
+        glucose_error = glucose_pred - target
+
+        # 计算目标函数值
+        # 1. 血糖偏离目标值的惩罚
+        obj_value = np.sum(glucose_error ** 2)
+
+        # 2. 低血糖惩罚 (更严重地惩罚低血糖)
+        hypoglycemia_penalty = 10.0 * np.sum(np.maximum(0, 80 - glucose_pred))
+        obj_value += hypoglycemia_penalty
+
+        # 3. 胰岛素变化率惩罚 (平滑控制)
+        if len(insulin_plan) > 1:
+            insulin_rate_change = np.diff(insulin_plan)
+            obj_value += 0.1 * np.sum(insulin_rate_change ** 2)
+
+        return obj_value
+
     def _mpc_policy(self, name, meal, glucose, sample_time):
         """
         实现MPC控制策略
@@ -170,57 +204,28 @@ class MPCController(Controller):
             meal_duration = int(30 / sample_time)  # 假设餐食持续30分钟
             meal_prediction[:min(meal_duration, pred_steps)] = meal
 
-        # 使用CVXPY求解MPC优化问题
         try:
-            # 定义优化变量 (胰岛素输注计划)
-            insulin_var = cp.Variable(ctrl_steps)
+            # 初始胰岛素计划 (使用基础率作为初始猜测)
+            initial_insulin_plan = np.ones(ctrl_steps) * basal
 
-            # 设置约束条件
-            constraints = [
-                insulin_var >= 0,  # 胰岛素不能为负
-                insulin_var <= basal * 10  # 胰岛素上限
-            ]
+            # 设置优化边界
+            bounds = [(0, basal * 10) for _ in range(ctrl_steps)]
 
-            # 构建完整的胰岛素计划 (控制时域后保持最后一个值)
-            # insulin_plan = cp.hstack([insulin_var, cp.repeat(insulin_var[-1], pred_steps - ctrl_steps)])
-            insulin_plan_extension = []
-            for _ in range(pred_steps - ctrl_steps):
-                insulin_plan_extension.append(insulin_var[-1])
+            # 使用scipy.optimize进行优化
+            result = optimize.minimize(
+                self._objective_function,
+                initial_insulin_plan,
+                args=(glucose, meal_prediction[:ctrl_steps], ctrl_steps, self.target),
+                bounds=bounds,
+                method='L-BFGS-B'
+            )
 
-            if len(insulin_plan_extension) > 0:
-                insulin_plan = cp.hstack([insulin_var, *insulin_plan_extension])
-            else:
-                insulin_plan = insulin_var
+            if result.success:
+                # 获取最优胰岛素输注计划
+                optimal_insulin_plan = result.x
 
-            # 预测血糖水平
-            initial_glucose = glucose
-
-            # 定义目标函数
-            # 1. 血糖偏离目标值的惩罚
-            glucose_pred = self._predict_glucose(initial_glucose, insulin_plan.value, meal_prediction, pred_steps)
-            glucose_error = glucose_pred - self.target
-
-            # 使用二次型目标函数
-            objective = cp.sum_squares(glucose_error)
-
-            # 2. 添加胰岛素变化率惩罚 (平滑控制)
-            if len(self.insulin_history) > 0:
-                last_insulin = self.insulin_history[-1]
-                insulin_rate_change = cp.diff(cp.hstack([last_insulin, insulin_var]))
-                objective += 0.1 * cp.sum_squares(insulin_rate_change)
-
-            # 3. 低血糖惩罚 (更严重地惩罚低血糖)
-            hypoglycemia_penalty = 10.0 * cp.sum(cp.maximum(0, 80 - glucose_pred))
-            objective += hypoglycemia_penalty
-
-            # 定义并求解问题
-            prob = cp.Problem(cp.Minimize(objective), constraints)
-            prob.solve(solver=cp.OSQP, verbose=False)
-
-            # 检查求解状态
-            if prob.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-                # 获取最优胰岛素输注量 (仅使用第一个控制动作)
-                optimal_insulin = insulin_var.value[0]
+                # 使用第一个控制动作
+                optimal_insulin = optimal_insulin_plan[0]
 
                 # 将总胰岛素分为基础率和大剂量
                 if meal > 0:
