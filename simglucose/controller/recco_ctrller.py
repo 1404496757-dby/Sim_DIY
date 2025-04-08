@@ -141,6 +141,13 @@ class RECCoController(Controller):
             }
             self.clouds.append(new_cloud)
             self.c += 1
+            # 重新计算 gamma 以包含新云
+            gamma = []
+            for cloud in self.clouds:
+                norm_sq = np.linalg.norm(x - cloud['mu']) ** 2
+                gamma_i = 1 / (1 + norm_sq + cloud['sigma'] - np.linalg.norm(cloud['mu']) ** 2)
+                gamma.append(gamma_i)
+            gamma = np.array(gamma)
             return self.c - 1, gamma  # 新云索引和 gamma
         else:
             # 更新关联云
@@ -245,3 +252,4 @@ class RECCoController(Controller):
         self.integral = 0
         self.k = 0
         self.prev_u = 0
+    
