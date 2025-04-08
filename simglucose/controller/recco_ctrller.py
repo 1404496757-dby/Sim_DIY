@@ -237,7 +237,7 @@ class RECCoController(Controller):
 
         # 5. 计算控制信号
         u = self._compute_control(active_idx, epsilon, self.integral, delta_epsilon)
-        if cgm < 140:
+        if cgm < 80:
             u = 0
 
         # 6. 保存状态
