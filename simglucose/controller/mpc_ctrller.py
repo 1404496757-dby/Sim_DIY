@@ -182,7 +182,15 @@ class MPCController(Controller):
             ]
 
             # 构建完整的胰岛素计划 (控制时域后保持最后一个值)
-            insulin_plan = cp.hstack([insulin_var, cp.repeat(insulin_var[-1], pred_steps - ctrl_steps)])
+            # insulin_plan = cp.hstack([insulin_var, cp.repeat(insulin_var[-1], pred_steps - ctrl_steps)])
+            insulin_plan_extension = []
+            for _ in range(pred_steps - ctrl_steps):
+                insulin_plan_extension.append(insulin_var[-1])
+
+            if len(insulin_plan_extension) > 0:
+                insulin_plan = cp.hstack([insulin_var, *insulin_plan_extension])
+            else:
+                insulin_plan = insulin_var
 
             # 预测血糖水平
             initial_glucose = glucose
