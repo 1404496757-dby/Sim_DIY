@@ -6,10 +6,10 @@ import pkg_resources
 import logging
 
 logger = logging.getLogger(__name__)
-# CONTROL_QUEST = pkg_resources.resource_filename('simglucose',
-#                                                 'params/Quest.csv')
-# PATIENT_PARA_FILE = pkg_resources.resource_filename(
-#     'simglucose', 'params/vpatient_params.csv')
+CONTROL_QUEST = pkg_resources.resource_filename('simglucose',
+                                                'params/Quest.csv')
+PATIENT_PARA_FILE = pkg_resources.resource_filename(
+    'simglucose', 'params/vpatient_params.csv')
 
 
 class CloudManager:
