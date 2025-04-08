@@ -269,7 +269,7 @@ class RECCoGlucoseController(Controller):
 
         # 自适应参数
         self.alpha = 0.1 * (self.u_range[1] - self.u_range[0]) / 20
-        self.G_sign = -1  # 胰岛素对血糖是负影响
+        self.G_sign = 1  # 胰岛素对血糖是负影响
         self.n_add = 20  # 5分钟采样，20个样本约1.5小时
 
         # 误差积分
@@ -324,9 +324,10 @@ class RECCoGlucoseController(Controller):
 
         # 2. 计算误差
         e = y_ref - CGM
+        E = self.target - CGM
 
         # 3. 数据预处理
-        x = self._normalize(e, y_ref)
+        x = self._normalize(E, y_ref)
 
         # 4. 演化机制
         densities = []
@@ -367,10 +368,14 @@ class RECCoGlucoseController(Controller):
             # 自适应律 (仅当误差较大时)
             if abs(e) > self.d_dead:
                 denom = 1 + self.target ** 2
-                delta_P = self.alpha * self.G_sign * abs(e * (e / self.Delta_e)) / denom
-                delta_I = self.alpha * self.G_sign * abs(e * self.Sigma_e) / denom
-                delta_D = self.alpha * self.G_sign * abs(e * Delta_e) / denom
-                delta_R = self.alpha * self.G_sign * e / denom
+                # delta_P = self.alpha * self.G_sign * abs(e * (e / self.Delta_e)) / denom
+                # delta_I = self.alpha * self.G_sign * abs(e * self.Sigma_e) / denom
+                # delta_D = self.alpha * self.G_sign * abs(e * Delta_e) / denom
+                # delta_R = self.alpha * self.G_sign * e / denom
+                delta_P = self.alpha * self.G_sign * abs(E * e) / denom
+                delta_I = self.alpha * self.G_sign * abs(E * Delta_e) / denom
+                delta_D = self.alpha * self.G_sign * abs(E * Delta_e) / denom
+                delta_R = self.alpha * self.G_sign * E / denom
 
                 # 应用泄漏和投影
                 new_params = (1 - self.sigma_L) * np.array([P, I, D, R]) + np.array(
@@ -386,8 +391,8 @@ class RECCoGlucoseController(Controller):
             # 低血糖安全保护
             if CGM < 140:  # 低血糖保护
                 basal_raw = 0
-            elif CGM < 160 and e < 0:  # 接近低血糖且血糖仍在下降
-                basal_raw = basal_raw * 0.5  # 减少胰岛素剂量
+            # elif CGM < 100 and e < 0:  # 接近低血糖且血糖仍在下降
+            #     basal_raw = basal_raw * 0.5  # 减少胰岛素剂量
             # 限制在允许范围内
             basal = max(self.u_range[0], min(basal_raw, self.u_range[1]))
             # 大餐时的额外胰岛素 (bolus)
