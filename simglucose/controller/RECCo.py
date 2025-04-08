@@ -2,9 +2,14 @@ import numpy as np
 import pandas as pd
 import os
 from .base import Controller, Action
+import pkg_resources
 import logging
 
 logger = logging.getLogger(__name__)
+# CONTROL_QUEST = pkg_resources.resource_filename('simglucose',
+#                                                 'params/Quest.csv')
+# PATIENT_PARA_FILE = pkg_resources.resource_filename(
+#     'simglucose', 'params/vpatient_params.csv')
 
 
 class CloudManager:
@@ -228,6 +233,9 @@ class CloudManager:
 
 class RECCoGlucoseController(Controller):
     def __init__(self, target=120, safe_min=140, safe_max=180, Ts=3, tau=40, y_range=(70, 180)):
+        self.quest = pd.read_csv(CONTROL_QUEST)
+        self.patient_params = pd.read_csv(PATIENT_PARA_FILE)
+        self.target = target
         """
         针对血糖控制的RECCo控制器
 
@@ -314,6 +322,9 @@ class RECCoGlucoseController(Controller):
         输出: Action(basal, bolus)
         """
         CGM = observation.CGM
+        sample_time = info.get('sample_time', 1)
+        pname = info.get('patient_name')
+        meal = info.get('meal')  # unit: g/min
         self.cloud_manager.increment_time()
 
         # 1. 参考模型
@@ -368,14 +379,14 @@ class RECCoGlucoseController(Controller):
             # 自适应律 (仅当误差较大时)
             if abs(e) > self.d_dead:
                 denom = 1 + self.target ** 2
-                # delta_P = self.alpha * self.G_sign * abs(e * (e / self.Delta_e)) / denom
-                # delta_I = self.alpha * self.G_sign * abs(e * self.Sigma_e) / denom
-                # delta_D = self.alpha * self.G_sign * abs(e * Delta_e) / denom
-                # delta_R = self.alpha * self.G_sign * e / denom
-                delta_P = self.alpha * self.G_sign * abs(E * e) / denom
-                delta_I = self.alpha * self.G_sign * abs(E * Delta_e) / denom
-                delta_D = self.alpha * self.G_sign * abs(E * Delta_e) / denom
-                delta_R = self.alpha * self.G_sign * E / denom
+                delta_P = self.alpha * self.G_sign * abs(e * (e / self.Delta_e)) / denom
+                delta_I = self.alpha * self.G_sign * abs(e * self.Sigma_e) / denom
+                delta_D = self.alpha * self.G_sign * abs(e * Delta_e) / denom
+                delta_R = self.alpha * self.G_sign * e / denom
+                # delta_P = self.alpha * self.G_sign * abs(E * e) / denom
+                # delta_I = self.alpha * self.G_sign * abs(E * Delta_e) / denom
+                # delta_D = self.alpha * self.G_sign * abs(E * Delta_e) / denom
+                # delta_R = self.alpha * self.G_sign * E / denom
 
                 # 应用泄漏和投影
                 new_params = (1 - self.sigma_L) * np.array([P, I, D, R]) + np.array(
@@ -397,11 +408,12 @@ class RECCoGlucoseController(Controller):
             basal = max(self.u_range[0], min(basal_raw, self.u_range[1]))
             # 大餐时的额外胰岛素 (bolus)
             bolus = 0  # 默认不使用bolus
+            # bolus = self._bb_policy(pname, meal, observation.CGM, sample_time)
             # 如果info中包含meal信息，可以考虑添加餐前胰岛素
-            if 'meal' in info and info['meal'] > 10:  # 大于10g的碳水被视为餐食
-                # 简单的餐前胰岛素计算 (碳水/胰岛素比例约为10:1)
-                bolus = info['meal'] / 10 * 0.5  # 每10g碳水给予0.5U胰岛素
-                bolus = min(bolus, 5.0)  # 限制最大bolus
+            # if 'meal' in info and info['meal'] > 10:  # 大于10g的碳水被视为餐食
+            #     # 简单的餐前胰岛素计算 (碳水/胰岛素比例约为10:1)
+            #     bolus = info['meal'] / 10 * 0.5  # 每10g碳水给予0.5U胰岛素
+            #     bolus = min(bolus, 5.0)  # 限制最大bolus
 
         # 更新状态
         self.last_e = e
@@ -412,6 +424,55 @@ class RECCoGlucoseController(Controller):
             self.save_cloud_data()
 
         return self.last_action
+
+    def _bb_policy(self, name, meal, glucose, env_sample_time):
+        """
+        Helper function to compute the basal and bolus amount.
+
+        The basal insulin is based on the insulin amount to keep the blood
+        glucose in the steady state when there is no (meal) disturbance.
+               basal = u2ss (pmol/(L*kg)) * body_weight (kg) / 6000 (U/min)
+
+        The bolus amount is computed based on the current glucose level, the
+        target glucose level, the patient's correction factor and the patient's
+        carbohydrate ratio.
+               bolus = ((carbohydrate / carbohydrate_ratio) +
+                       (current_glucose - target_glucose) / correction_factor)
+                       / sample_time
+        NOTE the bolus computed from the above formula is in unit U. The
+        simulator only accepts insulin rate. Hence the bolus is converted to
+        insulin rate.
+        """
+        if any(self.quest.Name.str.match(name)):
+            quest = self.quest[self.quest.Name.str.match(name)]
+            params = self.patient_params[self.patient_params.Name.str.match(
+                name)]
+            u2ss = params.u2ss.values.item()  # unit: pmol/(L*kg)
+            BW = params.BW.values.item()  # unit: kg
+        else:
+            quest = pd.DataFrame([['Average', 1 / 15, 1 / 50, 50, 30]],
+                                 columns=['Name', 'CR', 'CF', 'TDI', 'Age'])
+            u2ss = 1.43  # unit: pmol/(L*kg)
+            BW = 57.0  # unit: kg
+
+        basal = u2ss * BW / 6000  # unit: U/min
+        if meal > 0:
+            logger.info('Calculating bolus ...')
+            logger.info(f'Meal = {meal} g/min')
+            logger.info(f'glucose = {glucose}')
+            bolus = (
+                    (meal * env_sample_time) / quest.CR.values + (glucose > 150) *
+                    (glucose - self.target) / quest.CF.values).item()  # unit: U
+        else:
+            bolus = 0  # unit: U
+
+        # This is to convert bolus in total amount (U) to insulin rate (U/min).
+        # The simulation environment does not treat basal and bolus
+        # differently. The unit of Action.basal and Action.bolus are the same
+        # (U/min).
+        bolus = bolus / env_sample_time  # unit: U/min
+        return bolus
+
 
     def get_cloud_info(self, detailed=False):
         """
