@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import os
 from .base import Controller, Action
+import pkg_resources
 import logging
 
 logger = logging.getLogger(__name__)
