@@ -233,6 +233,9 @@ class CloudManager:
 
 class RECCoGlucoseController(Controller):
     def __init__(self, target=120, safe_min=140, safe_max=180, Ts=3, tau=40, y_range=(70, 180)):
+        self.quest = pd.read_csv(CONTROL_QUEST)
+        self.patient_params = pd.read_csv(PATIENT_PARA_FILE)
+        self.target = target
         """
         针对血糖控制的RECCo控制器
 
