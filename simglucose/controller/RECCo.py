@@ -269,7 +269,7 @@ class RECCoGlucoseController(Controller):
 
         # 自适应参数
         self.alpha = 0.1 * (self.u_range[1] - self.u_range[0]) / 20
-        self.G_sign = 1  # 胰岛素对血糖是负影响
+        self.G_sign = -1  # 胰岛素对血糖是负影响
         self.n_add = 20  # 5分钟采样，20个样本约1.5小时
 
         # 误差积分
