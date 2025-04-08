@@ -1,14 +1,18 @@
 from .base import Controller
 from .base import Action
 import numpy as np
+import pkg_resources
+import pandas as pd
 from scipy.optimize import minimize
 import logging
 
 logger = logging.getLogger(__name__)
+PATIENT_PARA_FILE = pkg_resources.resource_filename(
+    'simglucose', 'params/vpatient_params.csv')
 
 
 class MPCController(Controller):
-    def __init__(self, patient_params, prediction_horizon=5, control_horizon=3,
+    def __init__(self, patient_params = pd.read_csv(PATIENT_PARA_FILE), prediction_horizon=5, control_horizon=3,
                  target=140, Q=1, R=0.1, max_insulin=5):
         """
         MPC Controller for glucose regulation
