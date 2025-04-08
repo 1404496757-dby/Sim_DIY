@@ -5,10 +5,11 @@ from scipy.optimize import minimize
 import logging
 
 logger = logging.getLogger(__name__)
-
+PATIENT_PARA_FILE = pkg_resources.resource_filename(
+    'simglucose', 'params/vpatient_params.csv')
 
 class MPCController(Controller):
-    def __init__(self, patient_params, prediction_horizon=5, control_horizon=3,
+    def __init__(self, prediction_horizon=5, control_horizon=3,
                  target=140, Q=1, R=0.1, max_insulin=5):
         """
         MPC Controller for glucose regulation
@@ -22,7 +23,7 @@ class MPCController(Controller):
         - R: Weight for control action (insulin)
         - max_insulin: Maximum allowed insulin dose (U/min)
         """
-        self.patient_params = patient_params
+        self.patient_params = pd.read_csv(PATIENT_PARA_FILE)
         self.prediction_horizon = prediction_horizon
         self.control_horizon = control_horizon
         self.target = target
