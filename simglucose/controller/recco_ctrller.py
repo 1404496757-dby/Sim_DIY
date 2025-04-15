@@ -1,8 +1,17 @@
+from simglucose.controller.base import Controller
+from simglucose.controller.base import Action
 import numpy as np
+import logging
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+import threading
+import time
+from collections import deque
+
+logger = logging.getLogger(__name__)
 
 
-class RECCoController:
+class RECCoController(Controller):
     def __init__(self, target=140):
         # 目标血糖值
         self.target = target
