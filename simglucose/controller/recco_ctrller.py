@@ -18,27 +18,27 @@ class RECCoController(Controller):
 
         # 过程参数
         self.process_params = {
-            'Ts': 5.0,  # 采样时间5分钟
+            'Ts': 2.0,  # 采样时间5分钟
             'u_min': 0.0,  # 最小胰岛素注射量
-            'u_max': 10.0,  # 最大胰岛素注射量
+            'u_max': 20.0,  # 最大胰岛素注射量
             'r_min': 70.0,  # 最小血糖参考值
             'r_max': 180.0,  # 最大血糖参考值
-            'tau': 60.0  # 参考模型时间常数(分钟)
+            'tau': 40.0  # 参考模型时间常数(分钟)
         }
 
         # 进化参数
         self.evolving_params = {
             'gamma_max': 0.93,  # 密度阈值
-            'n_add': 12,  # 新增云的最小间隔(约1小时)
+            'n_add': 20,  # 新增云的最小间隔(约1小时)
             'max_rules': 100  # 最大规则数
         }
 
         # 自适应参数
         self.adaptation_params = {
-            'alpha_P': 0.05,  # PID参数自适应增益
-            'alpha_I': 0.01,
-            'alpha_D': 0.02,
-            'alpha_R': 0.01,
+            'alpha_P': 0.1,  # PID参数自适应增益
+            'alpha_I': 0.1,
+            'alpha_D': 0.1,
+            'alpha_R': 0.1,
             'G_sign': -1,  # 过程增益符号(负，因为胰岛素降低血糖)
             'd_dead': 5.0,  # 死区阈值5 mg/dL
             'sigma_L': 1e-6  # 泄漏系数
