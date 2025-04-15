@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 
 
 class RECCoController:
-    def __init__(self, process_params, evolving_params, adaptation_params):
+    def __init__(self, target=140):
         # 目标血糖值
         self.target = target
 
