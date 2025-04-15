@@ -227,7 +227,7 @@ class RECCoController(Controller):
             (y_r_k - self.process_params['r_min']) / self.Delta_r
         ])
 
-        self.cloud_points_history.append(x_k[0], x_k[1])
+        self.cloud_points_history.append([x_k[0], x_k[1]])
         self.x1_data.append(x_k[0])
         self.x2_data.append(x_k[1])
 
