@@ -133,7 +133,7 @@ class RECCoController(Controller):
             new_rule['theta'] = avg_theta
         else:
             # 第一条规则设置初始PID参数
-            new_rule['theta'] = np.array([0.05, 0.001, 0.01, 0])
+            new_rule['theta'] = np.array([0, 0, 0, 0])
 
         self.rules.append(new_rule)
         self.last_add_time = self.k
@@ -156,14 +156,14 @@ class RECCoController(Controller):
                 abs(e_k * Delta_epsilon_k)) / (1 + r_k ** 2)
         else:
             delta_P = self.adaptation_params['alpha_P'] * self.adaptation_params['G_sign'] * lambda_k * (
-                        e_k * epsilon_k) / (1 + r_k ** 2)
+                    e_k * epsilon_k) / (1 + r_k ** 2)
             delta_I = self.adaptation_params['alpha_I'] * self.adaptation_params['G_sign'] * lambda_k * (
-                        e_k * self.Sigma_e) / (1 + r_k ** 2)
+                    e_k * self.Sigma_e) / (1 + r_k ** 2)
             delta_D = self.adaptation_params['alpha_D'] * self.adaptation_params['G_sign'] * lambda_k * (
-                        e_k * Delta_epsilon_k) / (1 + r_k ** 2)
+                    e_k * Delta_epsilon_k) / (1 + r_k ** 2)
 
         delta_R = self.adaptation_params['alpha_R'] * self.adaptation_params['G_sign'] * lambda_k * epsilon_k / (
-                    1 + r_k ** 2)
+                1 + r_k ** 2)
 
         # 应用泄漏
         theta_new = (1 - self.adaptation_params['sigma_L']) * rule['theta'] + np.array(
@@ -227,7 +227,7 @@ class RECCoController(Controller):
             (y_r_k - self.process_params['r_min']) / self.Delta_r
         ])
 
-        self.cloud_points_history.append(x_k)
+        self.cloud_points_history.append(x_k[0], x_k[1])
         self.x1_data.append(x_k[0])
         self.x2_data.append(x_k[1])
 
