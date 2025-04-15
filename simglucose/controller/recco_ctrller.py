@@ -188,6 +188,75 @@ class PIDController(Controller):
 
         return u_k
 
+    def step(self, r_k, y_k):
+        """RECCo控制器的单步执行"""
+        self.k += 1
+
+        # 1. 参考模型生成期望轨迹(公式3)
+        y_r_k = self.reference_model(r_k)
+
+        # 2. 计算误差信号(公式4)
+        epsilon_k = y_r_k - y_k  # 跟踪误差
+        e_k = r_k - y_k  # 控制误差
+        Delta_epsilon_k = epsilon_k - self.e_prev  # 误差差分
+
+        # 更新积分项(公式14)
+        self.Sigma_e += epsilon_k
+
+        # 3. 构建归一化数据点(公式21)
+        x_k = np.array([
+            epsilon_k / self.Delta_epsilon,
+            (y_r_k - self.r_min) / self.Delta_r
+        ])
+        self.x1_data.append(x_k[0])
+        self.x2_data.append(x_k[1])
+
+        # 4. 规则进化机制
+        if len(self.rules) == 0:
+            # 初始状态下直接添加第一个规则
+            self.add_new_rule(x_k)
+            self.cloud_ids.append(0)  # 第一个点属于第一个云
+        else:
+            # 计算当前点与所有规则的局部密度
+            max_gamma = 0
+            best_rule_idx = 0
+
+            for i, rule in enumerate(self.rules):
+                gamma_k = self.calculate_local_density(x_k, rule)
+                rule['gamma_k'] = gamma_k
+
+                if gamma_k > max_gamma:
+                    max_gamma = gamma_k
+                    best_rule_idx = i
+
+            # 计算归一化密度(公式2)
+            sum_gamma = sum(rule['gamma_k'] for rule in self.rules)
+            for rule in self.rules:
+                rule['lambda_k'] = rule['gamma_k'] / sum_gamma if sum_gamma > 0 else 0
+
+            # 判断是否添加新规则
+            if (max_gamma < self.gamma_max and
+                    self.k - self.last_add_time >= self.n_add and
+                    len(self.rules) < self.max_rules):
+                self.add_new_rule(x_k)
+                self.cloud_ids.append(len(self.rules) - 1)  # 新点属于新创建的云
+            else:
+                # 更新最佳匹配规则的参数
+                self.update_rule_parameters(x_k, best_rule_idx)
+                self.cloud_ids.append(best_rule_idx)  # 记录当前点属于哪个云
+
+                # 死区检查(公式17)
+                if abs(epsilon_k) >= self.d_dead:
+                    self.adapt_parameters(best_rule_idx, e_k, epsilon_k, Delta_epsilon_k, r_k)
+
+        # 5. 计算控制量
+        u_k = self.control_law(e_k, epsilon_k, Delta_epsilon_k)
+
+        # 保存当前误差用于下一时刻差分
+        self.e_prev = epsilon_k
+
+        return u_k, y_r_k, x_k
+
     def reset(self):
         self.integrated_state = 0
         self.prev_state = 0
