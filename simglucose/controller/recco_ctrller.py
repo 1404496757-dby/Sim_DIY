@@ -44,6 +44,25 @@ class RECCoController(Controller):
             'sigma_L': 1e-6  # 泄漏系数
         }
 
+        self.Ts = self.evolving_params['Ts']
+        self.u_min = self.evolving_params['u_min']
+        self.u_max = self.evolving_params['u_max']
+        self.r_min = self.evolving_params['r_min']
+        self.r_max = self.evolving_params['r_max']
+        self.tau = self.evolving_params['tau']
+
+        self.gamma_max = self.evolving_params['gamma_max']
+        self.max_rules = self.evolving_params['max_rules']
+        self.n_add = self.evolving_params['n_add']
+
+        self.alpha_P = self.evolving_params['alpha_P']
+        self.alpha_I = self.evolving_params['alpha_I']
+        self.alpha_D = self.evolving_params['alpha_D']
+        self.alpha_R = self.evolving_params['alpha_R']
+        self.G_sign = self.evolving_params['G_sign']
+        self.d_dead = self.evolving_params['d_dead']
+        self.sigma_L = self.evolving_params['sigma_L']
+
         # 初始化RECCo控制器核心组件
         self.init_recco()
 
